@@ -1,0 +1,51 @@
+flowchart TB
+    subgraph door["Door hardware"]
+        CAM["Tapo C260 camera"]
+        SD[("SD card<br/>24/7 recording<br/>offline black box")]
+        LOCK["Aqara U400 lock<br/>Matter node"]
+        M100["Aqara M100<br/>Thread border router"]
+        CAM -.->|records 24/7| SD
+        LOCK -->|Thread| M100
+    end
+
+    subgraph mac["Mac Mini — everything local"]
+        FREG["Fregata NVR<br/>person detect + face recognition<br/>events DB + clips on disk"]
+        MS["Matter Server"]
+        HA["Home Assistant<br/>lock entity + 1 automation"]
+        LOG["entry-logger service<br/>cursor poller · lock webhook<br/>session builder · SQLite"]
+        MQ["Mosquitto<br/>optional latency upgrade"]
+    end
+
+    subgraph ext["External services"]
+        S3[("S3 / R2 bucket")]
+        NOTION["Notion DB — entry log"]
+        SLACK["Slack channel"]
+    end
+
+    ADMIN["Admin browser"]
+
+    CAM -->|RTSP stream| FREG
+    M100 -->|Matter over Thread| MS
+    MS --> HA
+    HA -->|"POST /webhook/lock<br/>unlock timestamp"| LOG
+
+    LOG -->|"GET /api/events?after=cursor"| FREG
+    FREG -->|"finished events + clip + snapshot"| LOG
+    FREG -.->|"frigate/events — later"| MQ
+    MQ -.->|"push on end event"| LOG
+
+    LOG -->|"upload clip + snapshot"| S3
+    LOG -->|"1 row per session<br/>durable link = /clip/:id"| NOTION
+    LOG -->|"alert only if unknown > 0"| SLACK
+
+    ADMIN -.->|clicks Notion / Slack link| LOG
+    LOG -.->|"302 to fresh presigned URL"| ADMIN
+    ADMIN -.-> S3
+    SLACK -.->|"snapshot via presigned URL"| S3
+
+    classDef localNode fill:#1e293b,stroke:#64748b,color:#e2e8f0
+    classDef extNode fill:#0f172a,stroke:#94a3b8,color:#cbd5e1
+    classDef future fill:#1e293b,stroke:#64748b,color:#94a3b8,stroke-dasharray:4 3
+    class CAM,SD,LOCK,M100,FREG,MS,HA,LOG localNode
+    class S3,NOTION,SLACK extNode
+    class MQ future

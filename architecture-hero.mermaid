@@ -1,0 +1,30 @@
+flowchart LR
+    subgraph door["At the door"]
+        CAM["Tapo C260<br/>camera"]
+        LOCK["Aqara U400<br/>lock"]
+    end
+
+    subgraph mac["Mac Mini — everything local"]
+        FREG["Fregata NVR<br/>person + face recognition"]
+        HA["Home Assistant<br/>Matter + 1 automation"]
+        LOG["entry-logger<br/>cursor · sessions · SQLite"]
+    end
+
+    subgraph ext["External"]
+        S3[("S3 / R2<br/>clips")]
+        NOTION["Notion<br/>entry log"]
+        SLACK["Slack<br/>alerts"]
+    end
+
+    CAM -->|RTSP| FREG
+    LOCK -->|Matter over Thread| HA
+    FREG -->|"pulled by cursor poll"| LOG
+    HA -->|"unlock timestamp"| LOG
+    LOG --> S3
+    LOG --> NOTION
+    LOG -->|"only if unknown > 0"| SLACK
+
+    classDef localNode fill:#1e293b,stroke:#64748b,color:#e2e8f0
+    classDef extNode fill:#0f172a,stroke:#94a3b8,color:#cbd5e1
+    class CAM,LOCK,FREG,HA,LOG localNode
+    class S3,NOTION,SLACK extNode

@@ -1,0 +1,23 @@
+# Home Assistant automation. This is the real webhook in the system:
+# HA calls the entry-logger. Frigate cannot, which is why the poller exists.
+alias: Door unlock -> entry-logger
+mode: queued
+triggers:
+  - trigger: state
+    entity_id: lock.aqara_u400   # confirm the entity id after Matter pairing
+    to: unlocked
+actions:
+  - action: rest_command.notify_entry_logger
+    data:
+      unlock_id: "{{ trigger.to_state.last_changed | as_timestamp | string }}-{{ trigger.entity_id }}"
+      timestamp: "{{ trigger.to_state.last_changed | as_timestamp }}"
+
+# configuration.yaml
+# rest_command:
+#   notify_entry_logger:
+#     url: "http://127.0.0.1:8787/webhook/lock"
+#     method: POST
+#     headers:
+#       X-Webhook-Token: !secret entry_logger_token
+#     content_type: "application/json"
+#     payload: '{"id":"{{ unlock_id }}","timestamp":{{ timestamp }},"source":"aqara_u400"}'
