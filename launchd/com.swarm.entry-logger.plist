@@ -6,8 +6,9 @@
   <key>Label</key>          <string>com.swarm.entry-logger</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/node</string>
-    <string>/Users/YOURUSER/entry-logger/src/index.js</string>
+    <string>/Users/YOURUSER/entry-logger/venv/bin/python3</string>
+    <string>/Users/YOURUSER/entry-logger/reconciler.py</string>
+    <string>watch</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/YOURUSER/entry-logger</string>
   <key>RunAtLoad</key>      <true/>

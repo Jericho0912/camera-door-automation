@@ -7,9 +7,7 @@ import json
 import logging
 import mimetypes
 import os
-import shutil
 import sqlite3
-import sys
 import tempfile
 import time
 from dataclasses import dataclass
