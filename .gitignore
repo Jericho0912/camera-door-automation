@@ -1,16 +1,11 @@
 .agents
 .claude
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.coverage
-
-# Local runtime state and secrets
 .env
-reconciler-state.db
-reconciler-state.db-wal
-reconciler-state.db-shm
+venv/
+.venv/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+logs/
+skills-lock.json
