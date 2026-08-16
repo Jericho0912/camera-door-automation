@@ -1,2 +1,11 @@
 .agents
 .claude
+.env
+venv/
+.venv/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+logs/
+skills-lock.json
