@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import boto3
+import requests
 from botocore.config import Config as BotoConfig
 from dotenv import load_dotenv
 
@@ -39,6 +40,9 @@ class Settings:
     settle_seconds: float
     dry_run: bool
     upload_manifest: bool
+    notion_token: str | None
+    notion_database_id: str | None
+    notion_version: str
 
     @staticmethod
     def from_env() -> "Settings":
@@ -62,6 +66,9 @@ class Settings:
             settle_seconds=float(os.getenv("SETTLE_SECONDS", "5")),
             dry_run=b("DRY_RUN", True),
             upload_manifest=b("UPLOAD_EVENT_MANIFEST", True),
+            notion_token=os.getenv("NOTION_TOKEN", "").strip() or None,
+            notion_database_id=os.getenv("NOTION_DATABASE_ID", "").strip() or None,
+            notion_version=os.getenv("NOTION_VERSION", "2026-03-11").strip(),
         )
 
 
@@ -139,6 +146,13 @@ def open_state(path: Path) -> sqlite3.Connection:
         etag TEXT,
         uploaded_at REAL,
         PRIMARY KEY(event_id, source_path)
+      );
+      CREATE TABLE IF NOT EXISTS notion_delivery (
+        event_id TEXT PRIMARY KEY,
+        page_id TEXT,
+        synced_at REAL,
+        last_error TEXT,
+        updated_at REAL NOT NULL
       );
     """)
     conn.commit()
@@ -234,10 +248,90 @@ def upload_manifest(client, settings: Settings, key: str, manifest: dict[str, An
     client.put_object(Bucket=settings.bucket, Key=key, Body=body, ContentType="application/json")
 
 
+NOTION_API = "https://api.notion.com/v1"
+
+
+def notion_request(method: str, path: str, settings: Settings, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {settings.notion_token}",
+        "Notion-Version": settings.notion_version,
+        "Content-Type": "application/json",
+    }
+    for attempt in range(4):
+        resp = requests.request(method, NOTION_API + path, headers=headers, json=payload, timeout=30)
+        # 429 is the only safe blind retry: Notion rejected the call outright, so nothing was created.
+        if resp.status_code == 429 and attempt < 3:
+            time.sleep(float(resp.headers.get("Retry-After") or 2 ** attempt))
+            continue
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Notion {method} {path} failed {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
+    raise RuntimeError(f"Notion {method} {path} exhausted retries")
+
+
+def notion_properties(event: dict[str, Any], manifest_key: str | None, segments: int) -> dict[str, Any]:
+    sub = event.get("sub_label")
+    person = (sub if isinstance(sub, str) else "").strip() or "Unrecognized"
+    start = float(event["start_time"])
+    end = float(event["end_time"])
+    def local_iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat()
+    props: dict[str, Any] = {
+        "Event ID": {"title": [{"text": {"content": str(event["id"])}}]},
+        "Person": {"select": {"name": person}},
+        "Camera": {"select": {"name": str(event["camera"])}},
+        "Seen": {"date": {"start": local_iso(start), "end": local_iso(end)}},
+        "Duration (s)": {"number": round(end - start, 1)},
+        "Segments": {"number": segments},
+        "Manifest key": {"rich_text": [{"text": {"content": manifest_key or ""}}]},
+    }
+    if event.get("top_score") is not None:
+        props["Score"] = {"number": round(float(event["top_score"]), 3)}
+    return props
+
+
+def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, state: sqlite3.Connection, settings: Settings) -> None:
+    if settings.dry_run or not settings.notion_token or not settings.notion_database_id:
+        return
+    event_id = str(event["id"])
+    row = state.execute("SELECT synced_at FROM notion_delivery WHERE event_id=?", (event_id,)).fetchone()
+    if row and row["synced_at"] is not None:
+        return
+    try:
+        page_id = None
+        if row:  # a prior attempt failed mid-flight, so a page may already exist; no row means we never tried
+            found = notion_request("POST", f"/databases/{settings.notion_database_id}/query", settings,
+                                   {"filter": {"property": "Event ID", "title": {"equals": event_id}}})
+            results = found.get("results") or []
+            page_id = str(results[0]["id"]) if results else None
+        if page_id is None:
+            page = notion_request("POST", "/pages", settings, {
+                "parent": {"database_id": settings.notion_database_id},
+                "properties": notion_properties(event, manifest_key, segments),
+            })
+            page_id = str(page["id"])
+    except Exception as exc:
+        state.execute("""INSERT INTO notion_delivery(event_id,last_error,updated_at)
+                         VALUES(?,?,?)
+                         ON CONFLICT(event_id) DO UPDATE SET last_error=excluded.last_error,updated_at=excluded.updated_at""",
+                      (event_id, str(exc), time.time()))
+        state.commit()
+        raise
+    now = time.time()
+    state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,last_error,updated_at)
+                     VALUES(?,?,?,NULL,?)
+                     ON CONFLICT(event_id) DO UPDATE SET page_id=excluded.page_id,synced_at=excluded.synced_at,last_error=NULL,updated_at=excluded.updated_at""",
+                  (event_id, page_id, now, now))
+    state.commit()
+    LOG.info("Notion page %s for event %s", page_id, event_id)
+
+
 def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_table: str, recording_cols: set[str], state: sqlite3.Connection, client, settings: Settings) -> None:
     event_id = str(event["id"])
-    done = state.execute("SELECT completed_at FROM event_delivery WHERE event_id=?", (event_id,)).fetchone()
+    done = state.execute("SELECT completed_at,manifest_key FROM event_delivery WHERE event_id=?", (event_id,)).fetchone()
     if done and done["completed_at"] is not None:
+        segments_done = state.execute("SELECT COUNT(*) FROM segment_delivery WHERE event_id=? AND uploaded_at IS NOT NULL", (event_id,)).fetchone()[0]
+        sync_notion(event, done["manifest_key"], segments_done, state, settings)
         return
     start = float(event["start_time"]) - settings.pre_roll
     end = float(event["end_time"]) + settings.post_roll
@@ -301,6 +395,7 @@ def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_ta
                       (manifest_key if settings.upload_manifest else None, time.time(), time.time(), event_id))
         state.commit()
     LOG.info("%s event %s with %d segment(s)", "Planned" if settings.dry_run else "Completed", event_id, len(uploaded))
+    sync_notion(event, manifest_key if settings.upload_manifest else None, len(uploaded), state, settings)
 
 
 def inspect(settings: Settings) -> int:
@@ -357,7 +452,8 @@ def status(settings: Settings) -> int:
         complete = state.execute("SELECT COUNT(*) FROM event_delivery WHERE completed_at IS NOT NULL").fetchone()[0]
         failed = state.execute("SELECT COUNT(*) FROM event_delivery WHERE last_error IS NOT NULL").fetchone()[0]
         segments = state.execute("SELECT COUNT(*) FROM segment_delivery WHERE uploaded_at IS NOT NULL").fetchone()[0]
-        print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed, "segments_uploaded": segments, "dry_run": settings.dry_run}, indent=2))
+        notion_synced = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL").fetchone()[0]
+        print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed, "segments_uploaded": segments, "notion_synced": notion_synced, "dry_run": settings.dry_run}, indent=2))
         for row in state.execute("SELECT event_id,last_error FROM event_delivery WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
             print(f"FAILED {row['event_id']}: {row['last_error']}")
         return 0
