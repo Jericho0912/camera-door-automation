@@ -1,0 +1,155 @@
+"""Configuration parsing — the layer where a typo becomes a production incident."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import reconciler as rec
+
+
+@pytest.fixture(autouse=True)
+def no_dotenv(monkeypatch):
+    """``from_env`` calls ``load_dotenv()``, which reads whatever .env happens to
+    be on disk. Neutralise it so these tests describe the environment only."""
+    monkeypatch.setattr(rec, "load_dotenv", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    for name in (
+        "FREGATA_DB_PATH", "FREGATA_RECORDINGS_DIR", "STATE_DB_PATH", "S3_BUCKET",
+        "S3_PREFIX", "AWS_REGION", "S3_ENDPOINT_URL", "CAMERA", "LABEL",
+        "PRE_ROLL_SECONDS", "POST_ROLL_SECONDS", "POLL_SECONDS", "SETTLE_SECONDS",
+        "DRY_RUN", "UPLOAD_EVENT_MANIFEST", "NOTION_TOKEN", "NOTION_DATABASE_ID",
+        "NOTION_VERSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_defaults_are_safe(monkeypatch):
+    """An empty environment must not upload anything anywhere."""
+    s = rec.Settings.from_env()
+    assert s.dry_run is True, "an unconfigured install must never write to S3"
+    assert s.bucket == ""
+    assert s.camera is None
+    assert s.label == "person"
+    assert s.prefix == "fregata"
+    assert s.region == "us-east-1"
+    assert s.endpoint_url is None
+    assert (s.pre_roll, s.post_roll) == (10.0, 15.0)
+    assert (s.poll_seconds, s.settle_seconds) == (30.0, 5.0)
+    assert s.notion_token is None and s.notion_database_id is None
+
+
+def test_settings_is_immutable():
+    s = rec.Settings.from_env()
+    with pytest.raises(Exception):
+        s.dry_run = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "  True  ", "yes", "on", "ON"])
+def test_truthy_bool_spellings(monkeypatch, raw):
+    monkeypatch.setenv("DRY_RUN", raw)
+    assert rec.Settings.from_env().dry_run is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", "", "  ", "nope", "2", "y", "t"])
+def test_everything_else_is_false(monkeypatch, raw):
+    """Documented in .env.example: only 1/true/yes/on are true.
+
+    Note the consequence — ``DRY_RUN=y`` and ``DRY_RUN=`` both mean LIVE.
+    """
+    monkeypatch.setenv("DRY_RUN", raw)
+    assert rec.Settings.from_env().dry_run is False
+
+
+def test_empty_dry_run_flips_to_live(monkeypatch):
+    """The sharp edge, pinned on its own: blanking the var disables dry run."""
+    monkeypatch.setenv("DRY_RUN", "")
+    assert rec.Settings.from_env().dry_run is False
+
+
+def test_paths_are_tilde_expanded(monkeypatch):
+    monkeypatch.setenv("FREGATA_DB_PATH", "~/Fregata/config/frigate.db")
+    monkeypatch.setenv("FREGATA_RECORDINGS_DIR", "~/Fregata/media/recordings")
+    monkeypatch.setenv("STATE_DB_PATH", "~/state.db")
+    s = rec.Settings.from_env()
+    home = Path.home()
+    assert s.source_db == home / "Fregata/config/frigate.db"
+    assert s.recordings_dir == home / "Fregata/media/recordings"
+    assert s.state_db == home / "state.db"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("fregata", "fregata"),
+    ("/fregata/", "fregata"),
+    ("///a/b///", "a/b"),
+    ("", ""),
+])
+def test_prefix_slashes_are_stripped(monkeypatch, raw, expected):
+    monkeypatch.setenv("S3_PREFIX", raw)
+    assert rec.Settings.from_env().prefix == expected
+
+
+def test_blank_camera_means_all_cameras(monkeypatch):
+    monkeypatch.setenv("CAMERA", "   ")
+    assert rec.Settings.from_env().camera is None
+
+
+def test_blank_bucket_is_stripped_not_none(monkeypatch):
+    monkeypatch.setenv("S3_BUCKET", "  my-bucket  ")
+    assert rec.Settings.from_env().bucket == "my-bucket"
+
+
+def test_blank_endpoint_url_becomes_none(monkeypatch):
+    monkeypatch.setenv("S3_ENDPOINT_URL", "")
+    assert rec.Settings.from_env().endpoint_url is None
+
+
+def test_notion_credentials_are_stripped_to_none(monkeypatch):
+    monkeypatch.setenv("NOTION_TOKEN", "   ")
+    monkeypatch.setenv("NOTION_DATABASE_ID", "")
+    s = rec.Settings.from_env()
+    assert s.notion_token is None and s.notion_database_id is None
+
+
+@pytest.mark.parametrize("var", [
+    "PRE_ROLL_SECONDS", "POST_ROLL_SECONDS", "POLL_SECONDS", "SETTLE_SECONDS",
+])
+def test_non_numeric_duration_crashes_at_startup(monkeypatch, var):
+    """A unit suffix is a startup crash, as .env.example warns."""
+    monkeypatch.setenv(var, "10s")
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+
+@pytest.mark.parametrize("var", [
+    "PRE_ROLL_SECONDS", "POST_ROLL_SECONDS", "POLL_SECONDS", "SETTLE_SECONDS",
+])
+def test_blank_duration_crashes_at_startup(monkeypatch, var):
+    """Blanking rather than deleting a numeric var takes the service down."""
+    monkeypatch.setenv(var, "")
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+
+@pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=(
+    "No validation: a negative PRE_ROLL_SECONDS silently inverts the archive "
+    "window, so segments before the event are excluded instead of included."))
+def test_negative_padding_is_rejected(monkeypatch):
+    monkeypatch.setenv("PRE_ROLL_SECONDS", "-30")
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+
+@pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=(
+    "No validation: DRY_RUN=false with an empty S3_BUCKET is accepted at "
+    "startup and only fails later, per-event, inside upload_file."))
+def test_live_mode_without_bucket_is_rejected_at_startup(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("S3_BUCKET", "")
+    with pytest.raises(Exception):
+        rec.Settings.from_env()

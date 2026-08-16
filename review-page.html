@@ -1,0 +1,792 @@
+<title>Fregata Reconciler Review</title>
+<style>
+  /* ---- tokens: light is the base, both dark states redefine only these ---- */
+  :root {
+    --ground:      #F6F8F8;
+    --surface:     #FFFFFF;
+    --surface-2:   #EDF2F1;
+    --line:        #D7E0DE;
+    --line-soft:   #E6ECEB;
+    --ink:         #0F1716;
+    --ink-2:       #4A5856;
+    --ink-3:       #6E7C7A;
+    --accent:      #0C6E60;
+    --accent-ink:  #08554A;
+    --accent-soft: #E0EFEC;
+    --sev-high:    #A31C1C;
+    --sev-high-bg: #F7E6E6;
+    --sev-med:     #8A5407;
+    --sev-med-bg:  #F8EDDD;
+    --sev-low:     #3D5D6C;
+    --sev-low-bg:  #E6EDF1;
+    --good:        #10695A;
+    --shadow:      0 1px 2px rgba(15,23,22,.05), 0 8px 24px -16px rgba(15,23,22,.28);
+
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0B1110;
+      --surface:     #121A19;
+      --surface-2:   #182221;
+      --line:        #263331;
+      --line-soft:   #1D2827;
+      --ink:         #E7EFED;
+      --ink-2:       #9BACA8;
+      --ink-3:       #7A8C88;
+      --accent:      #45C6AE;
+      --accent-ink:  #7BDCC8;
+      --accent-soft: #10302B;
+      --sev-high:    #F49191;
+      --sev-high-bg: #351D1D;
+      --sev-med:     #E2AC58;
+      --sev-med-bg:  #33260F;
+      --sev-low:     #92B7C6;
+      --sev-low-bg:  #1B2A31;
+      --good:        #45C6AE;
+      --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0B1110;
+    --surface:     #121A19;
+    --surface-2:   #182221;
+    --line:        #263331;
+    --line-soft:   #1D2827;
+    --ink:         #E7EFED;
+    --ink-2:       #9BACA8;
+    --ink-3:       #7A8C88;
+    --accent:      #45C6AE;
+    --accent-ink:  #7BDCC8;
+    --accent-soft: #10302B;
+    --sev-high:    #F49191;
+    --sev-high-bg: #351D1D;
+    --sev-med:     #E2AC58;
+    --sev-med-bg:  #33260F;
+    --sev-low:     #92B7C6;
+    --sev-low-bg:  #1B2A31;
+    --good:        #45C6AE;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+  }
+  @media (min-width: 1080px) {
+    .shell { grid-template-columns: 200px minmax(0, 1fr); gap: 56px; padding-right: 40px; }
+  }
+
+  /* ---------------- masthead ---------------- */
+  .masthead {
+    grid-column: 1 / -1;
+    padding: 72px 0 40px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 48px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-size: clamp(34px, 5.2vw, 52px);
+    line-height: 1.05;
+    letter-spacing: -.028em;
+    font-weight: 660;
+    margin: 0 0 20px;
+    text-wrap: balance;
+    max-width: 16ch;
+  }
+  .standfirst {
+    font-size: clamp(17px, 2vw, 19.5px);
+    line-height: 1.55;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .runstrip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin-top: 36px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .runstrip div {
+    flex: 1 1 130px;
+    padding: 16px 20px;
+    border-right: 1px solid var(--line-soft);
+  }
+  .runstrip div:last-child { border-right: 0; }
+  .runstrip b {
+    display: block;
+    font-family: var(--mono);
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .runstrip span {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .runstrip .lit b { color: var(--accent); }
+
+  /* ---------------- side nav ---------------- */
+  nav.toc { display: none; }
+  @media (min-width: 1080px) {
+    nav.toc {
+      display: block;
+      position: sticky;
+      top: 40px;
+      align-self: start;
+      padding-top: 4px;
+    }
+    nav.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; }
+    nav.toc a {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--ink-3);
+      text-decoration: none;
+      border-left: 2px solid var(--line);
+      padding-left: 12px;
+      display: block;
+      transition: color .15s, border-color .15s;
+    }
+    nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); border-left-color: var(--accent); }
+  }
+
+  main { min-width: 0; }
+
+  section { margin-bottom: 68px; scroll-margin-top: 28px; }
+
+  h2 {
+    font-size: clamp(23px, 3vw, 29px);
+    letter-spacing: -.02em;
+    font-weight: 640;
+    margin: 0 0 8px;
+    text-wrap: balance;
+  }
+  .sectionnote {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .04em;
+    color: var(--ink-3);
+    margin: 0 0 28px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  h3 {
+    font-size: 18.5px;
+    letter-spacing: -.012em;
+    font-weight: 640;
+    margin: 34px 0 10px;
+    text-wrap: balance;
+  }
+  p { margin: 0 0 16px; max-width: 66ch; }
+  ul { margin: 0 0 16px; padding-left: 20px; max-width: 66ch; }
+  li { margin-bottom: 9px; }
+  strong { font-weight: 640; }
+  code {
+    font-family: var(--mono);
+    font-size: .875em;
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: .1em .34em;
+    word-break: break-word;
+  }
+  a { color: var(--accent); }
+
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 24px 26px;
+    margin: 0 0 30px;
+    box-shadow: var(--shadow);
+  }
+  .verdict p { margin: 0; max-width: 60ch; }
+  .verdict p + p { margin-top: 12px; }
+  .verdict .lede { font-size: 19px; line-height: 1.5; letter-spacing: -.012em; font-weight: 600; }
+
+  /* ---------------- tables ---------------- */
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--surface);
+    margin-bottom: 20px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 460px; }
+  caption {
+    caption-side: bottom;
+    text-align: left;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    padding: 10px 16px 12px;
+    border-top: 1px solid var(--line-soft);
+  }
+  th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--line-soft); }
+  th {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+  td.name { font-family: var(--mono); font-size: 13px; }
+  tr.flag td { background: var(--accent-soft); }
+  tr.flag td.name, tr.flag td.num { color: var(--accent-ink); font-weight: 600; }
+
+  /* ---------------- defects ---------------- */
+  .defects { display: grid; gap: 14px; }
+  .defect {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 20px 22px 20px 24px;
+    position: relative;
+    box-shadow: var(--shadow);
+  }
+  .defect::before {
+    content: "";
+    position: absolute;
+    left: 0; top: -1px; bottom: -1px;
+    width: 3px;
+    border-radius: 3px 0 0 3px;
+    background: var(--sev-low);
+  }
+  .defect.high::before { background: var(--sev-high); }
+  .defect.med::before  { background: var(--sev-med); }
+
+  .dhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .dnum {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .dtitle { font-size: 17px; font-weight: 640; letter-spacing: -.012em; margin: 0; flex: 1 1 260px; text-wrap: balance; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 2px;
+    white-space: nowrap;
+    background: var(--sev-low-bg);
+    color: var(--sev-low);
+  }
+  .high .chip { background: var(--sev-high-bg); color: var(--sev-high); }
+  .med  .chip { background: var(--sev-med-bg);  color: var(--sev-med); }
+  .defect p { font-size: 15.5px; margin-bottom: 12px; max-width: 68ch; }
+  .defect p:last-child { margin-bottom: 0; }
+
+  .refs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    padding-top: 12px;
+    margin-top: 14px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .refs span::before { content: "› "; color: var(--accent); }
+
+  .fix {
+    font-size: 14.5px;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-radius: 3px;
+    padding: 10px 14px;
+    margin: 0;
+    max-width: none;
+  }
+  .fix b {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-right: 8px;
+  }
+
+  pre {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    margin: 0 0 18px;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+  pre .hl { color: var(--sev-high); font-weight: 600; }
+
+  .goodlist { display: grid; gap: 12px; padding: 0; margin: 0; list-style: none; max-width: none; }
+  .goodlist li {
+    display: grid;
+    grid-template-columns: 18px 1fr;
+    gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 15px 18px;
+    margin: 0;
+    font-size: 15.5px;
+  }
+  .goodlist li::before { content: "✓"; color: var(--good); font-weight: 700; line-height: 1.5; }
+
+  footer {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    line-height: 1.9;
+  }
+
+  a:focus-visible, nav.toc a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <p class="eyebrow">Code review · reconciler.py · 484 lines</p>
+    <h1>Fregata Reconciler Review</h1>
+    <p class="standfirst">
+      A full read of the event-to-S3 reconciler, including the uncommitted Notion sync work,
+      alongside a new 214-test suite. Short answer on the god class: there isn't one — but the
+      instinct behind the question is correct, and the smell is hiding two levels down.
+    </p>
+
+    <div class="runstrip">
+      <div class="lit"><b>202</b><span>passing</span></div>
+      <div><b>12</b><span>defect xfails</span></div>
+      <div class="lit"><b>99%</b><span>line coverage</span></div>
+      <div><b>30s</b><span>suite runtime</span></div>
+      <div><b>1</b><span>class in file</span></div>
+    </div>
+  </header>
+
+  <nav class="toc" aria-label="Sections">
+    <ol>
+      <li><a href="#verdict">The verdict</a></li>
+      <li><a href="#metrics">Where it hides</a></li>
+      <li><a href="#defects">12 defects</a></li>
+      <li><a href="#smaller">Smaller items</a></li>
+      <li><a href="#good">What's good</a></li>
+      <li><a href="#tests">The suite</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <section id="verdict">
+      <h2>The verdict on the god class</h2>
+      <p class="sectionnote">Asked directly, answered directly</p>
+
+      <div class="verdict">
+        <p class="lede">There is no god class. The file defines exactly one class — <code>Settings</code>, a frozen dataclass with 18 fields and a single method.</p>
+        <p>That is the <em>opposite</em> of a god class: it has almost no behaviour at all. Everything else in the module is a plain function.</p>
+        <p>But the instinct is picking up something real. The god-object smell is genuinely present — it just lives in two places that aren't classes, which is why it doesn't show up when you go looking for a bloated class.</p>
+      </div>
+
+      <h3>It moved into a function</h3>
+      <p>
+        <code>process_event</code> is 69 lines with 7 parameters and 12 branches — nearly twice the size of
+        anything else in the file. In one scope it does six distinct jobs: completion check, segment query,
+        state insert, per-file validation, an upload loop with interleaved state writes, manifest
+        construction and upload, the completion write, and the Notion hand-off. Six reasons to change,
+        one function. That is the god-class problem with the word "class" removed.
+      </p>
+      <p>
+        The practical cost is <strong>temporal coupling</strong>. The ordering of the state writes relative to
+        the uploads is what makes a mid-event crash recoverable, but nothing in the code expresses or
+        enforces that ordering — it survives only as statement order inside a long function. Defect 1
+        below is exactly that ordering being wrong in one place.
+      </p>
+
+      <h3>And into a parameter object</h3>
+      <p>
+        <code>Settings</code> has 18 fields, is read 44 times, and is passed to 10 of the 22 functions. Every
+        function that receives it can reach every configuration value in the program:
+      </p>
+      <ul>
+        <li><code>notion_request</code> is handed all 18 fields to read <strong>two</strong> — <code>notion_token</code> and <code>notion_version</code>.</li>
+        <li><code>upload_file</code> is handed all 18 to read <strong>two</strong> — <code>bucket</code> and <code>dry_run</code>.</li>
+      </ul>
+      <p>
+        This is textbook feature envy, and it is why the S3 layer, the SQLite layer, the Notion layer and
+        the CLI are all transitively coupled despite having nothing to do with one another. Nothing stops
+        a future edit in the Notion code from reading <code>settings.recordings_dir</code>, and nothing would
+        flag it if it did.
+      </p>
+      <p>
+        The fix is not "introduce classes" — it is to narrow the parameters so each function declares what
+        it actually depends on:
+      </p>
+<pre><code>def upload_file(client, bucket: str, dry_run: bool, source: Path, key: str) -> str | None:
+def notion_request(method, path, auth: NotionAuth, payload=None) -> dict:</code></pre>
+      <p>
+        The dependency graph then becomes visible in the signatures. Keep <code>Settings</code> as the single
+        parsing point at the edge — that part is good design and the reason the test suite was possible
+        at all.
+      </p>
+
+      <h3>Two supporting symptoms</h3>
+      <p>
+        <strong>The module does six jobs.</strong> One 484-line file holds configuration, schema discovery,
+        Frigate queries, state persistence, S3 delivery, Notion sync and the CLI. The Notion feature is the
+        evidence: one feature required edits in five places. That blast radius in a <em>single-file program</em>
+        is the signal. The seam to cut first is <code>notion</code> — the only concern with no data dependency
+        on any other.
+      </p>
+      <p>
+        <strong>There are no domain types.</strong> Events and segments are <code>dict[str, Any]</code> from the
+        SQLite row all the way into the manifest and the Notion payload. Nothing validates shape at the
+        boundary, which is the direct cause of defect 6 — a BLOB in one column crashes serialisation
+        sixty lines from where it entered, after the uploads have already been paid for.
+      </p>
+    </section>
+
+    <section id="metrics">
+      <h2>Where the weight actually sits</h2>
+      <p class="sectionnote">Measured from the AST, not eyeballed</p>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Function</th><th>Lines</th><th>Params</th><th>Branches</th><th>Takes Settings</th></tr>
+          </thead>
+          <tbody>
+            <tr class="flag"><td class="name">process_event</td><td class="num">69</td><td class="num">7</td><td class="num">12</td><td class="num">yes</td></tr>
+            <tr><td class="name">open_state</td><td class="num">33</td><td class="num">1</td><td class="num">0</td><td class="num">—</td></tr>
+            <tr><td class="name">sync_notion</td><td class="num">33</td><td class="num">5</td><td class="num">8</td><td class="num">yes</td></tr>
+            <tr><td class="name">run_once</td><td class="num">26</td><td class="num">1</td><td class="num">5</td><td class="num">yes</td></tr>
+            <tr><td class="name">notion_properties</td><td class="num">18</td><td class="num">3</td><td class="num">3</td><td class="num">—</td></tr>
+            <tr><td class="name">main</td><td class="num">16</td><td class="num">0</td><td class="num">5</td><td class="num">—</td></tr>
+            <tr><td class="name">fetch_events</td><td class="num">15</td><td class="num">4</td><td class="num">4</td><td class="num">yes</td></tr>
+            <tr><td class="name">notion_request</td><td class="num">15</td><td class="num">4</td><td class="num">5</td><td class="num">yes</td></tr>
+            <tr><td class="name"><em>15 others</em></td><td class="num">≤15</td><td class="num">≤6</td><td class="num">≤6</td><td class="num">6 of 15</td></tr>
+          </tbody>
+        </table>
+        <caption>22 module-level functions · 1 class · 10 functions receive the full Settings object</caption>
+      </div>
+    </section>
+
+    <section id="defects">
+      <h2>Twelve defects</h2>
+      <p class="sectionnote">Ordered by operational severity · each backed by a strict-xfail test</p>
+
+      <p>
+        Every defect below is encoded in the suite as <code>@pytest.mark.defect</code> plus
+        <code>xfail(strict=True)</code>. Each test asserts the <em>correct</em> behaviour and is currently
+        expected to fail — so fixing one turns the suite red until the marker is removed. The list cannot
+        silently drift out of date.
+      </p>
+
+      <div class="defects">
+
+        <article class="defect high">
+          <div class="dhead"><span class="dnum">01</span><h3 class="dtitle">Failures before the first state write vanish silently</h3><span class="chip">High</span></div>
+          <p>
+            The error handler in <code>run_once</code> is an <code>UPDATE ... WHERE event_id=?</code>, but
+            <code>process_event</code> doesn't <code>INSERT</code> the row until line 340 — after
+            <code>float(event["start_time"])</code> and the segment query. Anything that throws before that
+            point updates <strong>zero rows</strong>. The error is logged once and then dropped from the state
+            database entirely, so <code>status</code> reports a clean system while the event is never delivered.
+          </p>
+          <p class="fix"><b>Fix</b>INSERT … ON CONFLICT DO UPDATE in the handler, not UPDATE.</p>
+          <div class="refs"><span>reconciler.py:437</span><span>test_cli.py::test_a_failure_before_the_first_insert_is_still_recorded</span></div>
+        </article>
+
+        <article class="defect high">
+          <div class="dhead"><span class="dnum">02</span><h3 class="dtitle">Losing the state DB duplicates every Notion page</h3><span class="chip">High</span></div>
+          <p>
+            Notion's <code>POST /pages</code> has no upsert, so deduplication rests entirely on the local state
+            database. The search-before-create guard only runs <code>if row:</code> — that is, only when a
+            previous attempt already left a row. With no row, it creates blind.
+          </p>
+          <p>
+            This isn't hypothetical. <code>.env.example</code> already warns that <code>STATE_DB_PATH</code>
+            defaults to a <em>relative</em> path, so running from a different working directory creates a second
+            empty state DB. Today that means re-uploading to S3 — wasteful but idempotent, same keys. With
+            Notion it means a duplicate page for every event ever seen.
+          </p>
+          <p class="fix"><b>Fix</b>Query Notion before creating, unconditionally — or make the state path absolute-or-fail at startup.</p>
+          <div class="refs"><span>reconciler.py:293</span><span>test_notion.py::test_losing_the_state_db_does_not_duplicate_pages</span></div>
+        </article>
+
+        <article class="defect high">
+          <div class="dhead"><span class="dnum">03</span><h3 class="dtitle">A BLOB in the event row crashes the manifest after the uploads</h3><span class="chip">High</span></div>
+          <p>
+            <code>parse_json</code> returns non-<code>str</code> values untouched, so a BLOB <code>data</code>
+            column arrives as <code>bytes</code>, gets spread into the manifest via <code>**event</code>, and
+            <code>json.dumps</code> raises <code>TypeError</code>. The segments are already uploaded and billed
+            at that point, and the event can never reach <code>completed_at</code> — so it retries, and
+            re-fails, forever.
+          </p>
+          <p class="fix"><b>Fix</b>Coerce or drop non-serialisable values when building the manifest; json.dumps(…, default=str) is the one-line version.</p>
+          <div class="refs"><span>reconciler.py:374</span><span>test_process_event.py::test_a_blob_data_column_does_not_break_the_manifest</span></div>
+        </article>
+
+        <article class="defect high">
+          <div class="dhead"><span class="dnum">04</span><h3 class="dtitle">The dry-run log leaks the person's name</h3><span class="chip">High · privacy</span></div>
+          <p>
+            <code>.env.example</code> is careful about this — it warns that <code>sub_label</code> is a real
+            person's name and ships <code>UPLOAD_EVENT_MANIFEST=false</code> by default. But the dry-run branch
+            of <code>upload_manifest</code> writes the entire manifest, <code>sub_label</code> included, to the
+            log at <code>INFO</code>. The privacy control is bypassed by the rehearsal mode that exists to make
+            the system safe to try out.
+          </p>
+          <div class="refs"><span>reconciler.py:246</span><span>test_upload.py::test_dry_run_manifest_does_not_log_personal_names</span></div>
+        </article>
+
+        <article class="defect med">
+          <div class="dhead"><span class="dnum">05</span><h3 class="dtitle">Ctrl-C during the poll interval crashes instead of exiting cleanly</h3><span class="chip">Medium</span></div>
+<pre><code>while True:
+    try:
+        run_once(settings)
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        LOG.exception("Reconciliation pass failed")
+    <span class="hl">time.sleep(settings.poll_seconds)   # outside the try</span></code></pre>
+          <p>
+            The process spends nearly all of its wall-clock time in that <code>sleep</code>, which is precisely
+            where a Ctrl-C lands. The handler written to give a clean <code>130</code> almost never gets the
+            chance; the operator sees a traceback instead.
+          </p>
+          <div class="refs"><span>reconciler.py:480</span><span>test_cli.py::test_ctrl_c_during_the_sleep_exits_cleanly</span></div>
+        </article>
+
+        <article class="defect med">
+          <div class="dhead"><span class="dnum">06</span><h3 class="dtitle">snapshot_db leaks a temp file on every failed poll</h3><span class="chip">Medium</span></div>
+          <p>
+            <code>mkstemp</code> runs before the backup, and only the <em>caller's</em> <code>finally</code>
+            unlinks it. If <code>src.backup(dst)</code> raises — corrupt DB, locked DB, disk full — the temp
+            file stays. Under <code>watch</code> that is one leaked file every <code>POLL_SECONDS</code>,
+            forever.
+          </p>
+          <p class="fix"><b>Fix</b>Wrap the backup in try/except inside snapshot_db and unlink on failure.</p>
+          <div class="refs"><span>reconciler.py:110</span><span>test_schema_discovery.py::test_failed_snapshot_leaves_no_temp_file</span></div>
+        </article>
+
+        <article class="defect med">
+          <div class="dhead"><span class="dnum">07</span><h3 class="dtitle">A permanently broken event retries forever</h3><span class="chip">Medium</span></div>
+          <p>
+            No attempt counter, no backoff, no dead-letter state. One event whose segment file was deleted
+            will log a full traceback every <code>POLL_SECONDS</code> indefinitely, burying real failures in
+            the log.
+          </p>
+          <p class="fix"><b>Fix</b>An attempts column and an abandoned_at state, or exponential backoff keyed on updated_at.</p>
+          <div class="refs"><span>reconciler.py:431</span><span>test_process_event.py::test_a_permanently_failing_event_is_eventually_given_up_on</span></div>
+        </article>
+
+        <article class="defect med">
+          <div class="dhead"><span class="dnum">08</span><h3 class="dtitle">watch discards the failure signal</h3><span class="chip">Medium</span></div>
+          <p>
+            <code>run_once</code> returns <code>1</code> when events failed. The <code>watch</code> loop ignores
+            the return value, so a launchd-managed service has no way to know anything is wrong. Only
+            <code>status</code> reveals it, and nothing runs <code>status</code>. At minimum, log a warning when
+            a pass reports failures.
+          </p>
+          <div class="refs"><span>reconciler.py:475</span><span>test_cli.py::test_watch_surfaces_persistent_failures</span></div>
+        </article>
+
+        <article class="defect med">
+          <div class="dhead"><span class="dnum">09</span><h3 class="dtitle">No startup validation of the configuration</h3><span class="chip">Medium</span></div>
+          <ul>
+            <li><code>DRY_RUN=false</code> with an empty <code>S3_BUCKET</code> is accepted, then fails per-event inside <code>upload_file</code> — a <code>watch</code> loop that fails 100% of events and keeps going.</li>
+            <li>A negative <code>PRE_ROLL_SECONDS</code> silently inverts the archive window rather than being rejected.</li>
+          </ul>
+          <p class="fix"><b>Fix</b>A __post_init__ check on Settings is the right place.</p>
+          <div class="refs"><span>test_settings.py::test_live_mode_without_bucket_is_rejected_at_startup</span></div>
+        </article>
+
+        <article class="defect">
+          <div class="dhead"><span class="dnum">10</span><h3 class="dtitle">Path traversal: uploads aren't constrained to the media root</h3><span class="chip">Low · security</span></div>
+          <p>
+            <code>canonical_path</code> returns any absolute path that exists, and
+            <code>relative_recording_key</code> quietly files anything outside <code>recordings_dir</code> under
+            <code>external/&lt;hash&gt;-&lt;name&gt;</code> rather than refusing it. A <code>recordings.path</code>
+            value pointing anywhere on the filesystem is read and uploaded to S3.
+          </p>
+          <p>
+            The trust model keeps this low-severity — the source DB is local Frigate — but it is a full
+            local-file-exfiltration primitive gated only on "nothing ever writes a bad path into that
+            column", and there's no reason to accept it.
+          </p>
+          <p class="fix"><b>Fix</b>Reject resolved paths that fall outside recordings_dir.</p>
+          <div class="refs"><span>reconciler.py:198</span><span>test_helpers.py::test_traversal_outside_the_media_root_is_refused</span></div>
+        </article>
+
+        <article class="defect">
+          <div class="dhead"><span class="dnum">11</span><h3 class="dtitle">Retry-After as an HTTP-date crashes the request</h3><span class="chip">Low</span></div>
+<pre><code>time.sleep(float(resp.headers.get("Retry-After") or 2 ** attempt))</code></pre>
+          <p>
+            RFC 9110 permits <code>Retry-After</code> to be an HTTP-date.
+            <code>float("Wed, 21 Oct 2015 07:28:00 GMT")</code> raises <code>ValueError</code>, converting a
+            routine rate limit into a hard event failure.
+          </p>
+          <div class="refs"><span>reconciler.py:264</span><span>test_notion.py::test_http_date_retry_after_is_tolerated</span></div>
+        </article>
+
+        <article class="defect">
+          <div class="dhead"><span class="dnum">12</span><h3 class="dtitle">A load-bearing invariant that only exists as statement order</h3><span class="chip">Low · note</span></div>
+          <p>
+            The ordering here is <em>correct</em> and worth stating explicitly, because it's easy to break:
+            <code>completed_at</code> is written before <code>sync_notion</code> runs, so a Notion outage cannot
+            make a successfully-archived event look undelivered. S3 is the product; Notion is a notification.
+            The suite now pins this. The problem is that nothing in the code says so — the invariant lives
+            only in statement order inside a 69-line function, which is the structural point from the
+            verdict above.
+          </p>
+          <div class="refs"><span>reconciler.py:393-398</span><span>test_process_event.py::test_notion_failure_does_not_undo_a_completed_delivery</span></div>
+        </article>
+
+      </div>
+    </section>
+
+    <section id="smaller">
+      <h2>Smaller items</h2>
+      <p class="sectionnote">Worth a pass, none of them urgent</p>
+      <ul>
+        <li>
+          <strong>Dead code.</strong> <code>reconciler.py:269</code> — the trailing
+          <code>raise RuntimeError(… exhausted retries)</code> is unreachable: <code>range(4)</code> makes the
+          last attempt <code>3</code>, the retry guard is <code>attempt &lt; 3</code>, so a fourth
+          <code>429</code> falls into the <code>&gt;= 400</code> branch and raises there. Coverage confirms the
+          line is never hit.
+        </li>
+        <li>
+          <strong>Name collision.</strong> The module-level function <code>upload_manifest</code> and the
+          <code>Settings.upload_manifest</code> field share a name. Legal, but
+          <code>if settings.upload_manifest: upload_manifest(…)</code> reads badly.
+        </li>
+        <li>
+          <strong>Shadowed builtin.</strong> <code>inspect</code> shadows the stdlib module name — harmless
+          today only because that module is never imported.
+        </li>
+        <li>
+          <strong>Unbounded rescan.</strong> <code>fetch_events</code> has no lower time bound, so every poll
+          re-reads and re-checks the entire event history. Fine at 50 events; not at 500k.
+        </li>
+        <li>
+          <strong>Ignore hygiene.</strong> <code>.gitignore</code> listed only <code>.agents</code> and
+          <code>.claude</code>, missing <code>__pycache__</code>, <code>.venv</code>, <code>.env</code> and the
+          local state DB. Fixed on the branch.
+        </li>
+      </ul>
+    </section>
+
+    <section id="good">
+      <h2>What's genuinely good</h2>
+      <p class="sectionnote">The decisions that should survive any refactor</p>
+      <ul class="goodlist">
+        <li><strong>Settings is frozen and parsed in exactly one place.</strong> This is the single seam that made 214 tests possible without patching <code>os.environ</code> everywhere.</li>
+        <li><strong>Schema discovery instead of hard-coded table names.</strong> <code>resolve_table</code> falls back to structural matching and <em>refuses to guess</em> when ambiguous — archiving the wrong footage is worse than failing loudly.</li>
+        <li><strong>The read-only snapshot.</strong> Each pass gets one consistent view and never touches the live NVR database.</li>
+        <li><strong>Segment-level delivery state.</strong> Resumption after a mid-event crash re-uploads nothing already delivered — verified end-to-end.</li>
+        <li><strong>The 429-only retry policy, with the reasoning in a comment.</strong> Deliberately not retrying 5xx because a blind retry could duplicate a created page is exactly right, and the comment saying so is worth more than the code.</li>
+        <li><strong>.env.example documents failure modes, not just variable names.</strong> It is the best-written file in the repo, and half the defects above were found by taking its warnings seriously.</li>
+      </ul>
+    </section>
+
+    <section id="tests">
+      <h2>The suite</h2>
+      <p class="sectionnote">tests/ · 214 tests · 99% line coverage · ~30s</p>
+
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>File</th><th>Covers</th></tr></thead>
+          <tbody>
+            <tr><td class="name">conftest.py</td><td>Frigate-shaped SQLite builder, on-disk segments, moto S3, wired pipeline</td></tr>
+            <tr><td class="name">test_settings.py</td><td>Env parsing, bool coercion, path expansion, validation gaps</td></tr>
+            <tr><td class="name">test_helpers.py</td><td>Timestamps, SQL quoting, JSON coercion, path canonicalisation and keying</td></tr>
+            <tr><td class="name">test_schema_discovery.py</td><td>resolve_table across schema variants, snapshot isolation</td></tr>
+            <tr><td class="name">test_state_and_queries.py</td><td>State DDL and idempotency, both source queries</td></tr>
+            <tr><td class="name">test_upload.py</td><td>S3 client config, upload, manifest, dry run</td></tr>
+            <tr><td class="name">test_notion.py</td><td>HTTP contract, retries, property mapping, sync idempotency</td></tr>
+            <tr><td class="name">test_process_event.py</td><td>End-to-end delivery, resumption, failure modes</td></tr>
+            <tr><td class="name">test_cli.py</td><td>All four commands, exit codes, temp-file hygiene</td></tr>
+          </tbody>
+        </table>
+        <caption>No network and no real AWS — moto fakes S3 through the real botocore stack, responses fakes Notion</caption>
+      </div>
+
+      <h3>Two notes on how it's built</h3>
+      <p>
+        <strong>The S3 client is session-scoped on purpose.</strong> Constructing a boto3 client loads
+        botocore's service model from disk, which costs about five seconds per call when the checkout sits
+        on a Windows drive mounted into WSL. Building it once took the suite from 140 seconds to 22. Each
+        test still gets a freshly emptied bucket.
+      </p>
+      <p>
+        <strong>Time is controlled, not slept through.</strong> Segment ages are set with <code>os.utime</code>;
+        the Notion backoff patches <code>time.sleep</code> and asserts the delays it was asked for.
+      </p>
+    </section>
+
+  </main>
+
+  <footer>
+    Branch <code>worktree-tests-and-review</code> · 2 commits · pushed to origin<br>
+    Full write-up in <code>CODE-REVIEW.md</code> · run instructions in <code>tests/README.md</code><br>
+    See only the defect probes: <code>pytest -m defect -rx</code>
+  </footer>
+
+</div>
