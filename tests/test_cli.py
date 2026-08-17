@@ -228,7 +228,8 @@ def test_status_on_a_fresh_install(settings_factory, capsys):
     assert rec.status(settings_factory()) == 0
     out = json.loads(capsys.readouterr().out)
     assert out == {"events_seen": 0, "events_complete": 0, "events_failed": 0,
-                   "segments_uploaded": 0, "notion_synced": 0, "dry_run": False}
+                   "segments_uploaded": 0, "notion_synced": 0, "notion_failed": 0,
+                   "notion_gave_up": 0, "dry_run": False}
 
 
 def test_status_counts_each_category(source_with, use_session_s3, segment_file, capsys):

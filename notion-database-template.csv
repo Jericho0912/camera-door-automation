@@ -1,0 +1,6 @@
+Event ID,Person,Camera,Seen,Duration (s),Score,Segments,Manifest key
+1786809272.368455-x1xezx,Unrecognized,door_camera,2026-08-15T23:54:32+08:00,6.0,,4,fregata/events/door_camera/1786809272.368455-x1xezx/manifest.json
+1786809229.451957-fi7m26,Ada,door_camera,2026-08-15T23:53:49+08:00,2.3,0.83,3,fregata/events/door_camera/1786809229.451957-fi7m26/manifest.json
+1786805363.386992-zi0drm,Ada,door_camera,2026-08-15T22:49:23+08:00,73.2,0.914,9,fregata/events/door_camera/1786805363.386992-zi0drm/manifest.json
+1786805257.973144-f1kw2a,Grace,door_camera,2026-08-15T22:47:37+08:00,47.3,0.877,7,fregata/events/door_camera/1786805257.973144-f1kw2a/manifest.json
+1786805215.167467-7dazbw,Unrecognized,door_camera,2026-08-15T22:46:55+08:00,10.6,0.652,5,fregata/events/door_camera/1786805215.167467-7dazbw/manifest.json
