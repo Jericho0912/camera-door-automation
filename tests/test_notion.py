@@ -318,14 +318,46 @@ def test_a_persistently_failing_event_is_eventually_given_up_on(http, state_db, 
     assert len([c for c in http.calls if c.request.url == PAGES]) == 3, "no calls after giving up"
 
 
-def test_the_attempt_is_recorded_before_the_network_call(http, state_db, notion_settings):
-    """A crash between creating the page and writing the result must still leave a row,
-    or the next pass creates a duplicate."""
+def test_a_dropped_connection_leaves_a_row_but_costs_no_attempt(http, state_db, notion_settings):
+    """The row must exist so the next pass dedupes before re-creating. But a dropped
+    connection says nothing about this event, so it must not count toward giving up."""
     http.add(responses.POST, PAGES, body=Exception("connection dropped"))
     rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
 
-    row = state_db.execute("SELECT attempts FROM notion_delivery WHERE event_id='e1'").fetchone()
-    assert row is not None and row["attempts"] == 1
+    row = state_db.execute("SELECT attempts,last_error FROM notion_delivery WHERE event_id='e1'").fetchone()
+    assert row is not None, "no row means the next pass would create a duplicate page"
+    assert row["attempts"] == 0, "a transient failure must be refunded"
+    assert row["last_error"] is not None
+
+
+def test_an_unreachable_workspace_costs_no_attempts(http, state_db, notion_settings):
+    """A wrong NOTION_DATABASE_ID or an unshared integration is global, not per-event.
+    Charging it would retire the whole backlog after a few minutes of misconfiguration."""
+    http.replace(responses.GET, f"{rec.NOTION_API}/databases/db123",
+                 json={"message": "not found"}, status=404)
+    for _ in range(8):                      # more polls than notion_max_attempts
+        rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
+
+    row = state_db.execute("SELECT attempts,synced_at FROM notion_delivery WHERE event_id='e1'").fetchone()
+    assert row["attempts"] == 0, "the event must still be syncable once the config is fixed"
+    assert row["synced_at"] is None
+
+    # Operator fixes the database id; the very next pass must succeed.
+    http.replace(responses.GET, f"{rec.NOTION_API}/databases/db123",
+                 json={"data_sources": []}, status=200)
+    http.add(responses.POST, PAGES, json={"id": "p1"}, status=200)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
+    assert state_db.execute(
+        "SELECT synced_at FROM notion_delivery WHERE event_id='e1'").fetchone()["synced_at"] is not None
+
+
+def test_a_rejected_page_does_cost_an_attempt(http, state_db, notion_settings):
+    """A 400 on /pages means Notion rejected THIS page — that is the event's fault."""
+    http.add(responses.POST, PAGES, json={"message": "validation_error"}, status=400)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
+
+    assert state_db.execute(
+        "SELECT attempts FROM notion_delivery WHERE event_id='e1'").fetchone()["attempts"] == 1
 
 
 def test_person_is_withheld_unless_explicitly_enabled(settings_factory):

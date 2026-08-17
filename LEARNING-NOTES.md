@@ -76,7 +76,7 @@ What we found:
 Buried in the noise:
 
 ```
-/Users/swarm/Fregata/media/clips/faces/echo
+/Users/swarm/Fregata/media/clips/faces/<name>
 /Users/swarm/Fregata/config/model_cache/facedet/landmarkdet.yaml
 ```
 

@@ -156,11 +156,12 @@ def open_state(path: Path) -> sqlite3.Connection:
         page_id TEXT,
         synced_at REAL,
         last_error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
         updated_at REAL NOT NULL
       );
     """)
     # CREATE TABLE IF NOT EXISTS never alters an existing table, so a state DB written by an
-    # older build keeps its old shape. Add the column explicitly when it is missing.
+    # older build keeps its old shape. This only fires for those; a fresh DB is already correct.
     if "attempts" not in table_columns(conn, "notion_delivery"):
         conn.execute("ALTER TABLE notion_delivery ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
     conn.commit()
@@ -260,6 +261,19 @@ NOTION_API = "https://api.notion.com/v1"
 _NOTION_TARGETS: tuple[dict[str, Any], str] | None = None
 
 
+class NotionError(RuntimeError):
+    def __init__(self, message: str, status: int | None):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def blames_this_event(self) -> bool:
+        # A 4xx that is not a rate limit means Notion rejected THIS page — bad property, bad
+        # value. Anything else (429, 5xx, timeout, connection error) is the service or the
+        # network, and must not count against one event's attempt budget.
+        return self.status is not None and 400 <= self.status < 500 and self.status != 429
+
+
 def notion_request(method: str, path: str, settings: Settings, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {settings.notion_token}",
@@ -273,9 +287,10 @@ def notion_request(method: str, path: str, settings: Settings, payload: dict[str
             time.sleep(retry_after_seconds(resp.headers.get("Retry-After"), attempt))
             continue
         if resp.status_code >= 400:
-            raise RuntimeError(f"Notion {method} {path} failed {resp.status_code}: {resp.text[:300]}")
+            raise NotionError(f"Notion {method} {path} failed {resp.status_code}: {resp.text[:300]}",
+                              resp.status_code)
         return resp.json()
-    raise RuntimeError(f"Notion {method} {path} exhausted retries")
+    raise NotionError(f"Notion {method} {path} exhausted retries", None)
 
 
 def retry_after_seconds(header: str | None, attempt: int) -> float:
@@ -309,11 +324,13 @@ def notion_targets(settings: Settings) -> tuple[dict[str, Any], str]:
 
 
 def notion_properties(event: dict[str, Any], manifest_key: str | None, segments: int, settings: Settings) -> dict[str, Any]:
-    sub = event.get("sub_label")
-    person = (sub if isinstance(sub, str) else "").strip() or "Unrecognized"
     # sub_label is a real person's name. Publishing it is opt-in, and a comma is not a legal
     # Notion select option, so strip it rather than let one enrolled name fail every run.
-    person = person.replace(",", " ").strip() if settings.notion_include_person else "Unrecognized"
+    if settings.notion_include_person:
+        sub = event.get("sub_label")
+        person = (sub if isinstance(sub, str) else "").replace(",", " ").strip() or "Unrecognized"
+    else:
+        person = "Unrecognized"
     start = float(event["start_time"])
     end = float(event["end_time"])
     def local_iso(ts: float) -> str:
@@ -332,6 +349,14 @@ def notion_properties(event: dict[str, Any], manifest_key: str | None, segments:
     return props
 
 
+def record_notion_error(state: sqlite3.Connection, event_id: str, exc: Exception) -> None:
+    state.execute("""INSERT INTO notion_delivery(event_id,last_error,updated_at)
+                     VALUES(?,?,?)
+                     ON CONFLICT(event_id) DO UPDATE SET last_error=excluded.last_error,updated_at=excluded.updated_at""",
+                  (event_id, str(exc), time.time()))
+    state.commit()
+
+
 def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, state: sqlite3.Connection, settings: Settings) -> None:
     if settings.dry_run or not settings.notion_token or not settings.notion_database_id:
         return
@@ -342,6 +367,18 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
     attempts = int(row["attempts"]) if row else 0
     if attempts >= settings.notion_max_attempts:
         return  # terminal: stop hammering Notion every poll for an event that will never sync
+
+    # Resolve the workspace target BEFORE touching the attempt counter. A failure here is a
+    # wrong NOTION_DATABASE_ID, an integration that was never shared, an expired token, or
+    # Notion being down — none of which is this event's fault. Counting it would let a few
+    # minutes of misconfiguration permanently retire the entire backlog.
+    try:
+        parent, query_path = notion_targets(settings)
+    except Exception as exc:
+        record_notion_error(state, event_id, exc)
+        LOG.warning("Notion unreachable (%s); no attempt charged to event %s", exc, event_id)
+        return
+
     # Record the attempt BEFORE the network call. A crash between creating the page and writing
     # the result would otherwise leave no row, and the next pass would create a duplicate page.
     state.execute("""INSERT INTO notion_delivery(event_id,attempts,updated_at)
@@ -350,7 +387,6 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
                   (event_id, attempts + 1, time.time()))
     state.commit()
     try:
-        parent, query_path = notion_targets(settings)
         page_id = None
         if row:  # a prior attempt may have created a page before failing; no row means we never tried
             try:
@@ -372,11 +408,14 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
         # Deliberately NOT re-raised. Notion is a secondary sink; letting this reach run_once
         # would write last_error into event_delivery, which tracks the S3 upload that succeeded,
         # and nothing clears that flag again for an already-completed event.
-        state.execute("UPDATE notion_delivery SET last_error=?,updated_at=? WHERE event_id=?",
-                      (str(exc), time.time(), event_id))
-        state.commit()
-        LOG.warning("Notion sync failed for event %s (attempt %d/%d): %s",
-                    event_id, attempts + 1, settings.notion_max_attempts, exc)
+        blamed = isinstance(exc, NotionError) and exc.blames_this_event
+        if not blamed:
+            # Refund the attempt: a 429, a 5xx or a dropped connection says nothing about
+            # whether this event will ever sync, so it must not count toward giving up.
+            state.execute("UPDATE notion_delivery SET attempts=? WHERE event_id=?", (attempts, event_id))
+        record_notion_error(state, event_id, exc)
+        LOG.warning("Notion sync failed for event %s (attempt %s): %s",
+                    event_id, f"{attempts + 1}/{settings.notion_max_attempts}" if blamed else "not charged", exc)
         return
     now = time.time()
     state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,last_error,updated_at)
