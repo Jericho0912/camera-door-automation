@@ -61,7 +61,8 @@ to read. This turned out to be the single most instructive moment in the whole s
 What we found:
 
 - It is Frigate's **application log** — the program's diary of what it is doing.
-- It contains real face recognition results: `Detected best face for person as: Echo with probability 0.83`
+- It contains real face recognition results: `Detected best face for person as: <name> with probability 0.83`
+  (names redacted here — they are real people, and this repo is public)
 - **But it is unusable as a data source.** The success lines have no event ID, no camera,
   no start/end time, and no video path. Across 12 days there were 687 recognitions and
   only 25 event IDs in the entire file — and those 25 appear only on *failure* lines.
@@ -107,7 +108,7 @@ Everything in this table was confirmed on your actual machine, not assumed.
 | Tables | `event`, `recordings`, `export`, `migratehistory`, `previews`, `regions`, `reviewsegment`, `timeline`, `trigger`, `user`, `userreviewstatus` | `.tables` |
 | Camera name | **`door_camera`** — not `door` | `SELECT DISTINCT camera` |
 | Label | `person` | Sample rows |
-| `sub_label` | Real person names: Aaron, Echo, Tiffany, Aldrich, Pia, Rayah, Dexter, Lennon, alexis | Log + sample rows |
+| `sub_label` | Real person names — 9 distinct people recognised (redacted; public repo) | Log + sample rows |
 | `sub_label` when unknown | **Empty string**, not `NULL` | Sample rows |
 | Finalized person events | **312** | `SELECT COUNT(*)` |
 | Event ID format | `<unix_timestamp>-<6 random chars>`, e.g. `1786809272.368455-x1xezx` | Sample rows |
@@ -469,8 +470,9 @@ accepting that dry-run failures appear only in the log, never in `status`.
 
 ### 🔒 Privacy — the one to fix first
 
-Your `sub_label` column holds **real people's names**: Aaron, Echo, Tiffany, Aldrich, Pia,
-Rayah, Dexter, Lennon, alexis.
+Your `sub_label` column holds **real people's names** — 9 distinct people were recognised
+in the log sample. The actual names are deliberately not reproduced here, because this
+repository is public.
 
 The manifest builder spreads the *entire raw event row*:
 
