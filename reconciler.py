@@ -45,6 +45,8 @@ class Settings:
     notion_version: str
     notion_include_person: bool
     notion_max_attempts: int
+    public_base_url: str | None
+    clip_url_ttl: int
 
     @staticmethod
     def from_env() -> "Settings":
@@ -73,6 +75,8 @@ class Settings:
             notion_version=os.getenv("NOTION_VERSION", "2026-03-11").strip(),
             notion_include_person=b("NOTION_INCLUDE_PERSON", False),
             notion_max_attempts=int(os.getenv("NOTION_MAX_ATTEMPTS", "5")),
+            public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/") or None,
+            clip_url_ttl=int(os.getenv("CLIP_URL_TTL_SECONDS", "300")),
         )
 
 
@@ -233,7 +237,10 @@ def s3_client(settings: Settings):
         "s3",
         region_name=settings.region,
         endpoint_url=settings.endpoint_url,
-        config=BotoConfig(retries={"max_attempts": 8, "mode": "standard"}),
+        # s3v4 explicitly: without it presigning can fall back to the deprecated SigV2,
+        # which newer regions reject outright. Uploads are unaffected either way.
+        config=BotoConfig(signature_version="s3v4",
+                          retries={"max_attempts": 8, "mode": "standard"}),
     )
 
 
@@ -346,6 +353,10 @@ def notion_properties(event: dict[str, Any], manifest_key: str | None, segments:
     }
     if event.get("top_score") is not None:
         props["Score"] = {"number": round(float(event["top_score"]), 3)}
+    if settings.public_base_url:
+        # A stable link, not a presigned URL. clipserver.py resolves it to a short-lived
+        # signed URL when clicked, so this never expires and is useless off the tailnet.
+        props["Clip"] = {"url": f"{settings.public_base_url}/clip/{event['id']}"}
     return props
 
 
