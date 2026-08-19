@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.swarm.clipserver</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOURUSER/ws/camera-door-automation/.venv/bin/python</string>
+    <string>/Users/YOURUSER/ws/camera-door-automation/clipserver.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/YOURUSER/ws/camera-door-automation</string>
+  <key>RunAtLoad</key><true/>
+  <!-- Unlike the reconciler, this genuinely is a long-lived process, so KeepAlive fits. -->
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/YOURUSER/ws/camera-door-automation/logs/clipserver.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOURUSER/ws/camera-door-automation/logs/clipserver.err.log</string>
+</dict>
+</plist>

@@ -386,3 +386,23 @@ def test_a_data_source_workspace_uses_the_new_parent_and_query_path(http, state_
 
     body = json.loads([c for c in http.calls if c.request.url == PAGES][0].request.body)
     assert body["parent"] == {"data_source_id": "ds-9"}
+
+
+def test_clip_url_is_written_when_a_public_base_url_is_set(settings_factory):
+    """A stable link, not a presigned one — clipserver resolves it at click time."""
+    s = settings_factory(public_base_url="https://mac-mini.tail1234.ts.net")
+    props = rec.notion_properties(make_event(id="1700000000.0-abc123"), "k", 3, s)
+    assert props["Clip"]["url"] == "https://mac-mini.tail1234.ts.net/clip/1700000000.0-abc123"
+    assert "X-Amz-Signature" not in props["Clip"]["url"], "must not bake in a signature"
+
+
+def test_clip_is_omitted_without_a_public_base_url(settings_factory):
+    """No tailnet, no Clip column — behaviour is unchanged for everyone else."""
+    props = rec.notion_properties(make_event(), "k", 1, settings_factory(public_base_url=None))
+    assert "Clip" not in props
+
+
+def test_a_trailing_slash_on_the_base_url_does_not_double_up(settings_factory, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://mac-mini.tail1234.ts.net/")
+    monkeypatch.setenv("S3_BUCKET", "b")
+    assert rec.Settings.from_env().public_base_url == "https://mac-mini.tail1234.ts.net"

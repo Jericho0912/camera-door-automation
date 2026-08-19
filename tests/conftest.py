@@ -169,6 +169,8 @@ def settings_factory(tmp_path: Path, recordings_dir: Path):
             notion_version="2026-03-11",
             notion_include_person=True,
             notion_max_attempts=5,
+            public_base_url=None,
+            clip_url_ttl=300,
         )
         base.update(over)
         return rec.Settings(**base)
@@ -234,7 +236,8 @@ def _s3_client(_moto):
         prefix="", region="us-east-1", endpoint_url=None, camera=None, label="person",
         pre_roll=0, post_roll=0, poll_seconds=0, settle_seconds=0, dry_run=True,
         upload_manifest=False, notion_token=None, notion_database_id=None,
-        notion_version="v", notion_include_person=False, notion_max_attempts=5))
+        notion_version="v", notion_include_person=False, notion_max_attempts=5,
+        public_base_url=None, clip_url_ttl=300))
 
 
 @pytest.fixture
