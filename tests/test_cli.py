@@ -229,7 +229,8 @@ def test_status_on_a_fresh_install(settings_factory, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out == {"events_seen": 0, "events_complete": 0, "events_failed": 0,
                    "segments_uploaded": 0, "notion_synced": 0, "notion_failed": 0,
-                   "notion_gave_up": 0, "dry_run": False}
+                   "notion_gave_up": 0, "clip_synced": 0, "clip_pending": 0,
+                   "clip_gave_up": 0, "dry_run": False}
 
 
 def test_status_counts_each_category(source_with, use_session_s3, segment_file, capsys):
@@ -255,6 +256,29 @@ def test_status_counts_each_category(source_with, use_session_s3, segment_file, 
 def test_status_reports_dry_run_mode(settings_factory, capsys):
     rec.status(settings_factory(dry_run=True))
     assert json.loads(capsys.readouterr().out)["dry_run"] is True
+
+
+def test_status_lists_clip_backfill_failures_with_their_error_text(settings_factory, capsys):
+    """Clip failures live on SYNCED rows, which the NOTION FAILED listing excludes
+    by design — without a listing of their own, clip_gave_up would be a bare
+    number and the actual Notion error (e.g. 'Clip is not a property') would be
+    diagnosable only by opening the SQLite file."""
+    settings = settings_factory()
+    state = rec.open_state(settings.state_db)
+    state.execute(
+        "INSERT INTO notion_delivery(event_id,page_id,synced_at,last_error,attempts,updated_at,clip_attempts)"
+        " VALUES(?,?,?,?,?,?,?)",
+        ("e1", "page-1", 100.0, "Notion PATCH /pages/page-1 failed 400: Clip is not a property", 1, 100.0, 5))
+    state.commit()
+    state.close()
+
+    rec.status(settings)
+    out = capsys.readouterr().out
+    counts = json.loads(out[:out.index("\nCLIP FAILED")])
+    assert counts["clip_gave_up"] == 1
+    assert counts["notion_failed"] == 0, "a clip failure must not count against creation health"
+    assert "CLIP FAILED e1: " in out and "Clip is not a property" in out
+    assert "NOTION FAILED" not in out
 
 
 def test_status_lists_at_most_ten_failures(settings_factory, capsys):

@@ -6,6 +6,7 @@ POST /pages has no upsert — so the dedupe logic here carries real weight.
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 import responses
@@ -406,3 +407,255 @@ def test_a_trailing_slash_on_the_base_url_does_not_double_up(settings_factory, m
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://mac-mini.tail1234.ts.net/")
     monkeypatch.setenv("S3_BUCKET", "b")
     assert rec.Settings.from_env().public_base_url == "https://mac-mini.tail1234.ts.net"
+
+
+# --------------------------------------------------------------------------
+# backfill_clip — patching the Clip link onto already-synced pages
+# --------------------------------------------------------------------------
+
+CLIP_BASE = "https://mac-mini.tail1234.ts.net"
+
+
+@pytest.fixture
+def clip_settings(settings_factory):
+    """Same workspace as notion_settings, but with a clipserver configured."""
+    def _make(**over):
+        base = dict(dry_run=False, notion_token="secret_tok", notion_database_id="db123",
+                    notion_version="2026-03-11", public_base_url=CLIP_BASE)
+        base.update(over)
+        return settings_factory(**base)
+    return _make
+
+
+def patches(http):
+    return [c for c in http.calls if c.request.method == "PATCH"]
+
+
+def clip_row(state_db, event_id="e1"):
+    return state_db.execute(
+        "SELECT page_id,synced_at,clip_synced_at,clip_attempts,last_error"
+        " FROM notion_delivery WHERE event_id=?", (event_id,)).fetchone()
+
+
+def sync_page_without_clip(http, state_db, notion_settings, event_id="e1", page_id="page-1"):
+    """Create a page the way the pre-clip-links build did: synced, no Clip column.
+
+    This is exactly the state of the 312-event backlog — synced_at set,
+    clip_synced_at NULL — reproduced through the real creation path so the
+    production SQL writes the row, not the test.
+    """
+    http.add(responses.POST, PAGES, json={"id": page_id}, status=200)
+    rec.sync_notion(make_event(id=event_id), "k", 1, state_db, notion_settings)
+    row = clip_row(state_db, event_id)
+    assert row["synced_at"] is not None and row["clip_synced_at"] is None
+    return row
+
+
+def test_backfill_patches_the_clip_url_onto_a_synced_page(http, state_db, notion_settings, clip_settings):
+    """The backlog case: page synced before PUBLIC_BASE_URL existed, then the
+    operator configures the clipserver. The next pass must PATCH exactly once."""
+    sync_page_without_clip(http, state_db, notion_settings)
+
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-1", json={"id": "page-1"}, status=200)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    sent = patches(http)
+    assert len(sent) == 1
+    assert sent[0].request.url == f"{rec.NOTION_API}/pages/page-1"
+    assert json.loads(sent[0].request.body) == {
+        "properties": {"Clip": {"url": f"{CLIP_BASE}/clip/e1"}}}
+    row = clip_row(state_db)
+    assert row["clip_synced_at"] is not None
+    assert row["last_error"] is None
+
+    # Idempotency: the clip is recorded as delivered, so the next pass is silent.
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+    assert len(patches(http)) == 1, "a backfilled page must never be patched twice"
+
+
+def test_no_patch_is_ever_sent_without_a_public_base_url(http, state_db, notion_settings):
+    """No clipserver, no Clip column — and crucially no attempt charged, so the
+    backlog stays eligible for the day PUBLIC_BASE_URL is finally set."""
+    sync_page_without_clip(http, state_db, notion_settings)
+
+    for _ in range(3):
+        rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
+
+    assert patches(http) == []
+    row = clip_row(state_db)
+    assert row["clip_synced_at"] is None
+    assert row["clip_attempts"] == 0
+
+
+def test_a_rejected_patch_goes_terminal_without_touching_synced_at(http, state_db, notion_settings, clip_settings):
+    """A Notion DB with no Clip property 400s on EVERY patch. That must go
+    terminal after notion_max_attempts, not hammer Notion every 30s poll —
+    and the page itself stays synced throughout: only the clip failed."""
+    sync_page_without_clip(http, state_db, notion_settings)
+    s = clip_settings(notion_max_attempts=3)
+
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-1",
+             json={"message": "Clip is not a property that exists"}, status=400)
+    for _ in range(6):                        # more polls than the budget allows
+        rec.sync_notion(make_event(id="e1"), "k", 1, state_db, s)
+
+    assert len(patches(http)) == 3, "no PATCHes after giving up"
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 3, "must stop counting at the limit"
+    assert row["clip_synced_at"] is None
+    assert row["synced_at"] is not None, "a clip failure must never unsync the page"
+    assert "400" in row["last_error"]
+
+
+def test_a_5xx_patch_is_refunded_and_retried(http, state_db, notion_settings, clip_settings):
+    """A 500 says nothing about this page — Notion was having a moment. The
+    attempt must be refunded so an outage cannot retire the clip backlog."""
+    sync_page_without_clip(http, state_db, notion_settings)
+
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-1", json={"message": "boom"}, status=500)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 0, "a transient failure must be refunded"
+    assert row["clip_synced_at"] is None
+    assert row["last_error"] is not None
+
+    # Notion recovers; the very next pass must succeed.
+    http.replace(responses.PATCH, f"{rec.NOTION_API}/pages/page-1", json={"id": "page-1"}, status=200)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+    assert clip_row(state_db)["clip_synced_at"] is not None
+
+
+def test_a_dropped_connection_on_patch_is_refunded_and_retried(http, state_db, notion_settings, clip_settings):
+    sync_page_without_clip(http, state_db, notion_settings)
+
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-1", body=Exception("connection dropped"))
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 0, "the network is not this event's fault"
+    assert row["clip_synced_at"] is None
+
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-1", json={"id": "page-1"}, status=200)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+    assert clip_row(state_db)["clip_synced_at"] is not None
+
+
+def test_a_page_created_with_a_base_url_needs_no_backfill(http, state_db, clip_settings):
+    """notion_properties already put the Clip column into the created page, so
+    clip_synced_at is stamped at creation and no pointless PATCH follows."""
+    s = clip_settings()
+    http.add(responses.POST, PAGES, json={"id": "page-1"}, status=200)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, s)
+
+    assert clip_row(state_db)["clip_synced_at"] is not None
+
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, s)
+    assert patches(http) == [], "the clip arrived with the page; nothing to patch"
+
+
+def test_an_old_state_db_gains_the_clip_columns(tmp_path):
+    """A state DB written before clip links existed must migrate in place, and
+    its rows must come out backfill-eligible (clip_synced_at NULL, 0 attempts)."""
+    db = tmp_path / "old-state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE notion_delivery (
+                      event_id TEXT PRIMARY KEY,
+                      page_id TEXT,
+                      synced_at REAL,
+                      last_error TEXT,
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      updated_at REAL NOT NULL)""")
+    conn.execute("INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)"
+                 " VALUES('e1','page-1',1.0,1.0)")
+    conn.commit()
+    conn.close()
+
+    state = rec.open_state(db)
+    try:
+        assert {"clip_synced_at", "clip_attempts"} <= rec.table_columns(state, "notion_delivery")
+        row = state.execute("SELECT clip_synced_at,clip_attempts FROM notion_delivery"
+                            " WHERE event_id='e1'").fetchone()
+        assert row["clip_synced_at"] is None, "old rows are exactly the backlog to backfill"
+        assert row["clip_attempts"] == 0
+    finally:
+        state.close()
+
+
+def insert_synced_row_without_page_id(state_db, event_id="e1"):
+    # A synced row should always have its page_id, but a crash between the page
+    # POST and the success UPDATE (or a hand-edited DB) can leave it NULL.
+    state_db.execute(
+        "INSERT INTO notion_delivery(event_id,page_id,synced_at,attempts,updated_at)"
+        " VALUES(?,NULL,?,1,?)", (event_id, NOW, NOW))
+    state_db.commit()
+
+
+def test_a_missing_page_id_is_recovered_through_the_dedupe_query(http, state_db, clip_settings):
+    insert_synced_row_without_page_id(state_db)
+    http.add(responses.POST, f"{rec.NOTION_API}/databases/db123/query",
+             json={"results": [{"id": "page-77"}]}, status=200)
+    http.add(responses.PATCH, f"{rec.NOTION_API}/pages/page-77", json={"id": "page-77"}, status=200)
+
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    query = [c for c in http.calls if c.request.url.endswith("/query")][0]
+    assert json.loads(query.request.body)["filter"] == {
+        "property": "Event ID", "title": {"equals": "e1"}}
+    assert len(patches(http)) == 1
+    row = clip_row(state_db)
+    assert row["clip_synced_at"] is not None
+    assert row["page_id"] == "page-77", "the recovered page_id must be persisted"
+
+
+def test_a_synced_row_whose_page_cannot_be_found_is_charged(http, state_db, clip_settings):
+    """The lookup RAN and found nothing: this row will never succeed, so the
+    attempt counts — otherwise it queries Notion on every poll forever."""
+    insert_synced_row_without_page_id(state_db)
+    http.add(responses.POST, f"{rec.NOTION_API}/databases/db123/query",
+             json={"results": []}, status=200)
+
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 1
+    assert row["clip_synced_at"] is None
+    assert row["last_error"] is not None
+    assert patches(http) == [], "nothing to patch without a page"
+
+
+def test_a_failed_page_lookup_is_not_charged(http, state_db, clip_settings):
+    """The lookup itself failing is the workspace or the network, not this
+    event — same blame semantics as the creation path's target resolution."""
+    insert_synced_row_without_page_id(state_db)
+    http.replace(responses.GET, f"{rec.NOTION_API}/databases/db123",
+                 json={"message": "not found"}, status=404)
+
+    for _ in range(8):                      # more polls than notion_max_attempts
+        rec.sync_notion(make_event(id="e1"), "k", 1, state_db, clip_settings())
+
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 0, "still eligible once the config is fixed"
+    assert row["last_error"] is not None
+
+
+def test_status_reports_the_clip_backfill_counters(settings_factory, capsys):
+    settings = settings_factory(notion_max_attempts=3)
+    state = rec.open_state(settings.state_db)
+    rows = [
+        ("done", "p1", NOW, NOW, 0),        # clip delivered
+        ("pending", "p2", NOW, None, 1),    # synced, clip still owed, budget left
+        ("dead", "p3", NOW, None, 3),       # synced, clip gave up at the limit
+        ("unsynced", None, None, None, 0),  # no page yet: not backfill's problem
+    ]
+    state.executemany(
+        "INSERT INTO notion_delivery(event_id,page_id,synced_at,clip_synced_at,clip_attempts,updated_at)"
+        " VALUES(?,?,?,?,?,1.0)", rows)
+    state.commit()
+    state.close()
+
+    assert rec.status(settings) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["clip_synced"] == 1
+    assert out["clip_pending"] == 1
+    assert out["clip_gave_up"] == 1

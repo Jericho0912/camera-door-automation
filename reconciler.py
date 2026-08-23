@@ -161,6 +161,8 @@ def open_state(path: Path) -> sqlite3.Connection:
         synced_at REAL,
         last_error TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
+        clip_synced_at REAL,
+        clip_attempts INTEGER NOT NULL DEFAULT 0,
         updated_at REAL NOT NULL
       );
     """)
@@ -168,6 +170,12 @@ def open_state(path: Path) -> sqlite3.Connection:
     # older build keeps its old shape. This only fires for those; a fresh DB is already correct.
     if "attempts" not in table_columns(conn, "notion_delivery"):
         conn.execute("ALTER TABLE notion_delivery ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    # Clip backfill state. NULL clip_synced_at on an already-synced row is exactly what makes
+    # the pre-clip-links backlog eligible for a PATCH once PUBLIC_BASE_URL is configured.
+    if "clip_synced_at" not in table_columns(conn, "notion_delivery"):
+        conn.execute("ALTER TABLE notion_delivery ADD COLUMN clip_synced_at REAL")
+    if "clip_attempts" not in table_columns(conn, "notion_delivery"):
+        conn.execute("ALTER TABLE notion_delivery ADD COLUMN clip_attempts INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -368,12 +376,94 @@ def record_notion_error(state: sqlite3.Connection, event_id: str, exc: Exception
     state.commit()
 
 
+def backfill_clip(event_id: str, row: sqlite3.Row, state: sqlite3.Connection, settings: Settings) -> None:
+    """PATCH the Clip URL onto an already-synced Notion page.
+
+    Pages synced before clip links existed (or before PUBLIC_BASE_URL was configured) never
+    got a Clip column, and the synced_at short-circuit means creation will never revisit
+    them. This is the only page-update path in the program, and it must stay as quiet as the
+    creation path: never raise, never touch synced_at.
+    """
+    if not settings.public_base_url:
+        return  # no clipserver configured; nothing to write, and nothing to charge
+    if row["clip_synced_at"] is not None:
+        return
+    clip_attempts = int(row["clip_attempts"])
+    if clip_attempts >= settings.notion_max_attempts:
+        # Terminal, same budget as page creation. A Notion DB with no Clip property 400s on
+        # every PATCH; without this cap the whole backlog would hammer Notion on every poll.
+        return
+
+    page_id = row["page_id"]
+    if page_id is None:
+        # A synced row should always carry its page_id, but be defensive: re-find the page
+        # with the same 'Event ID' dedupe query the creation path uses.
+        try:
+            _, query_path = notion_targets(settings)
+            found = notion_request("POST", query_path, settings,
+                                   {"filter": {"property": "Event ID", "title": {"equals": event_id}}})
+            results = found.get("results") or []
+            page_id = str(results[0]["id"]) if results else None
+        except Exception as exc:
+            # The lookup failing is the network or the workspace, not this event — record it
+            # but charge nothing, mirroring the blame semantics of the creation path.
+            record_notion_error(state, event_id, exc)
+            LOG.warning("Notion clip lookup failed for event %s; no attempt charged: %s", event_id, exc)
+            return
+        if page_id is None:
+            # The lookup ran and found nothing: a synced row whose page cannot be found will
+            # never succeed, so this IS the event's fault — charge the attempt.
+            state.execute("UPDATE notion_delivery SET clip_attempts=?,updated_at=? WHERE event_id=?",
+                          (clip_attempts + 1, time.time(), event_id))
+            record_notion_error(state, event_id,
+                                RuntimeError(f"clip backfill: no Notion page found for event {event_id}"))
+            LOG.warning("Notion clip backfill found no page for event %s (attempt %s/%s)",
+                        event_id, clip_attempts + 1, settings.notion_max_attempts)
+            return
+
+    # Pre-charge the attempt before the network call, consistent with the creation path. PATCH
+    # is idempotent, so the cost of a crash here is one wasted attempt, not a duplicate page.
+    # page_id rides along so an id recovered by the lookup above survives a failed PATCH —
+    # otherwise every retry would repeat the notion_targets resolution and the dedupe query.
+    state.execute("UPDATE notion_delivery SET page_id=?,clip_attempts=?,updated_at=? WHERE event_id=?",
+                  (page_id, clip_attempts + 1, time.time(), event_id))
+    state.commit()
+    try:
+        notion_request("PATCH", f"/pages/{page_id}", settings, {
+            "properties": {"Clip": {"url": f"{settings.public_base_url}/clip/{event_id}"}},
+        })
+    except Exception as exc:
+        # Deliberately NOT re-raised: Notion is a secondary sink, and synced_at stays exactly
+        # as it is — the page itself is fine, only the Clip column is missing.
+        blamed = isinstance(exc, NotionError) and exc.blames_this_event
+        if not blamed:
+            # Refund: a 429, 5xx or dropped connection says nothing about whether this
+            # page will ever accept the Clip property.
+            state.execute("UPDATE notion_delivery SET clip_attempts=? WHERE event_id=?",
+                          (clip_attempts, event_id))
+        record_notion_error(state, event_id, exc)
+        LOG.warning("Notion clip backfill failed for event %s (attempt %s): %s",
+                    event_id, f"{clip_attempts + 1}/{settings.notion_max_attempts}" if blamed else "not charged", exc)
+        return
+    now = time.time()
+    # Persist page_id too: if we had to re-find it above, the row is healed for free.
+    state.execute("""UPDATE notion_delivery
+                        SET page_id=?,clip_synced_at=?,last_error=NULL,updated_at=?
+                      WHERE event_id=?""",
+                  (page_id, now, now, event_id))
+    state.commit()
+    LOG.info("Notion clip link backfilled onto page %s for event %s", page_id, event_id)
+
+
 def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, state: sqlite3.Connection, settings: Settings) -> None:
     if settings.dry_run or not settings.notion_token or not settings.notion_database_id:
         return
     event_id = str(event["id"])
-    row = state.execute("SELECT synced_at,attempts FROM notion_delivery WHERE event_id=?", (event_id,)).fetchone()
+    row = state.execute("SELECT synced_at,attempts,page_id,clip_synced_at,clip_attempts FROM notion_delivery WHERE event_id=?",
+                        (event_id,)).fetchone()
     if row and row["synced_at"] is not None:
+        # The page exists; the only thing it might still be missing is the Clip link.
+        backfill_clip(event_id, row, state, settings)
         return
     attempts = int(row["attempts"]) if row else 0
     if attempts >= settings.notion_max_attempts:
@@ -399,6 +489,7 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
     state.commit()
     try:
         page_id = None
+        created = False
         if row:  # a prior attempt may have created a page before failing; no row means we never tried
             try:
                 found = notion_request("POST", query_path, settings,
@@ -415,6 +506,7 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
                 "properties": notion_properties(event, manifest_key, segments, settings),
             })
             page_id = str(page["id"])
+            created = True
     except Exception as exc:
         # Deliberately NOT re-raised. Notion is a secondary sink; letting this reach run_once
         # would write last_error into event_delivery, which tracks the S3 upload that succeeded,
@@ -429,10 +521,17 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
                     event_id, f"{attempts + 1}/{settings.notion_max_attempts}" if blamed else "not charged", exc)
         return
     now = time.time()
-    state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,last_error,updated_at)
-                     VALUES(?,?,?,NULL,?)
-                     ON CONFLICT(event_id) DO UPDATE SET page_id=excluded.page_id,synced_at=excluded.synced_at,last_error=NULL,updated_at=excluded.updated_at""",
-                  (event_id, page_id, now, now))
+    # A page CREATED just now with public_base_url set already carries the Clip property
+    # (notion_properties put it there), so stamp clip_synced_at and skip the pointless PATCH.
+    # Deliberately NOT stamped for a dedupe-found page: that page may predate clip links, and
+    # one idempotent PATCH next pass is cheaper than assuming it has the column. Created
+    # without a base URL, clip_synced_at stays NULL so a later-configured PUBLIC_BASE_URL
+    # backfills the link naturally.
+    clip_synced = now if (created and settings.public_base_url) else None
+    state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,clip_synced_at,last_error,updated_at)
+                     VALUES(?,?,?,?,NULL,?)
+                     ON CONFLICT(event_id) DO UPDATE SET page_id=excluded.page_id,synced_at=excluded.synced_at,clip_synced_at=excluded.clip_synced_at,last_error=NULL,updated_at=excluded.updated_at""",
+                  (event_id, page_id, now, clip_synced, now))
     state.commit()
     LOG.info("Notion page %s for event %s", page_id, event_id)
 
@@ -566,13 +665,23 @@ def status(settings: Settings) -> int:
         notion_synced = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL").fetchone()[0]
         notion_failed = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NULL AND last_error IS NOT NULL").fetchone()[0]
         notion_gaveup = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NULL AND attempts>=?", (settings.notion_max_attempts,)).fetchone()[0]
+        # Clip backfill progress. Only synced pages count as pending/gave-up: an unsynced
+        # event has no page to patch yet, so its missing clip is not backfill's problem.
+        clip_synced = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE clip_synced_at IS NOT NULL").fetchone()[0]
+        clip_pending = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL AND clip_synced_at IS NULL AND clip_attempts<?", (settings.notion_max_attempts,)).fetchone()[0]
+        clip_gaveup = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL AND clip_synced_at IS NULL AND clip_attempts>=?", (settings.notion_max_attempts,)).fetchone()[0]
         print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed, "segments_uploaded": segments,
                           "notion_synced": notion_synced, "notion_failed": notion_failed, "notion_gave_up": notion_gaveup,
+                          "clip_synced": clip_synced, "clip_pending": clip_pending, "clip_gave_up": clip_gaveup,
                           "dry_run": settings.dry_run}, indent=2))
         for row in state.execute("SELECT event_id,last_error FROM event_delivery WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
             print(f"FAILED {row['event_id']}: {row['last_error']}")
         for row in state.execute("SELECT event_id,last_error FROM notion_delivery WHERE synced_at IS NULL AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
             print(f"NOTION FAILED {row['event_id']}: {row['last_error']}")
+        # Clip failures live on SYNCED rows, which the loop above excludes by design — without
+        # this listing, clip_gave_up climbing would be a number with no diagnosis attached.
+        for row in state.execute("SELECT event_id,last_error FROM notion_delivery WHERE synced_at IS NOT NULL AND clip_synced_at IS NULL AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
+            print(f"CLIP FAILED {row['event_id']}: {row['last_error']}")
         return 0
     finally:
         state.close()

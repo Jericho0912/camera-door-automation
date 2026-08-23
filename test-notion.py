@@ -12,6 +12,8 @@ if not props and db.get("data_sources"):          # 2025-09-03+ splits schema on
 
 want = {"Event ID":"title","Person":"select","Camera":"select","Seen":"date",
         "Duration (s)":"number","Score":"number","Segments":"number","Manifest key":"rich_text"}
+if os.getenv("PUBLIC_BASE_URL"):                  # Clip is only written (and backfilled) when set
+    want["Clip"] = "url"
 print(f"{'PROPERTY':<16} {'ACTUAL':<12} {'WANTED':<12}")
 for name, wtype in want.items():
     actual = props.get(name, {}).get("type", "-- MISSING --")
