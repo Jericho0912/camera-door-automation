@@ -12,6 +12,10 @@ if not props and db.get("data_sources"):          # 2025-09-03+ splits schema on
 
 want = {"Event ID":"title","Person":"select","Camera":"select","Seen":"date",
         "Duration (s)":"number","Score":"number","Segments":"number","Manifest key":"rich_text"}
+if os.getenv("CLIP_LINKS", "").strip().lower() in {"1", "true", "yes", "on"}:
+    # A missing Clip property 400s every PATCH and burns the whole backlog's clip
+    # budget — exactly the drift this preflight exists to catch before a live run.
+    want["Clip"] = "url"
 print(f"{'PROPERTY':<16} {'ACTUAL':<12} {'WANTED':<12}")
 for name, wtype in want.items():
     actual = props.get(name, {}).get("type", "-- MISSING --")

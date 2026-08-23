@@ -22,7 +22,8 @@ def clean_env(monkeypatch):
         "S3_PREFIX", "AWS_REGION", "S3_ENDPOINT_URL", "CAMERA", "LABEL",
         "PRE_ROLL_SECONDS", "POST_ROLL_SECONDS", "POLL_SECONDS", "SETTLE_SECONDS",
         "DRY_RUN", "UPLOAD_EVENT_MANIFEST", "NOTION_TOKEN", "NOTION_DATABASE_ID",
-        "NOTION_VERSION",
+        "NOTION_VERSION", "CLIP_LINKS", "CLIP_URL_TTL_SECONDS", "CLIP_REFRESH_SECONDS",
+        "CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -40,6 +41,41 @@ def test_defaults_are_safe(monkeypatch):
     assert (s.pre_roll, s.post_roll) == (10.0, 15.0)
     assert (s.poll_seconds, s.settle_seconds) == (30.0, 5.0)
     assert s.notion_token is None and s.notion_database_id is None
+    assert s.clip_links is False, "clip links must be opt-in"
+
+
+def test_manifest_upload_defaults_off(monkeypatch):
+    """The manifest embeds sub_label — a real name. Deleting the env line, which
+    .env.example's own header recommends for unwanted settings, must not enable it."""
+    assert rec.Settings.from_env().upload_manifest is False
+
+
+def test_clip_ttl_is_clamped_to_the_sigv4_maximum(monkeypatch):
+    monkeypatch.setenv("CLIP_URL_TTL_SECONDS", "999999999")
+    assert rec.Settings.from_env().clip_url_ttl == 604_800
+
+
+def test_clip_refresh_must_be_shorter_than_the_ttl(monkeypatch):
+    """A refresh age at or past the TTL guarantees every link dies before renewal."""
+    monkeypatch.setenv("CLIP_LINKS", "true")
+    monkeypatch.setenv("CLIP_URL_TTL_SECONDS", "86400")
+    monkeypatch.setenv("CLIP_REFRESH_SECONDS", "86400")
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+
+def test_clip_refresh_is_not_validated_when_the_feature_is_off(monkeypatch):
+    """A stale pair of CLIP_* leftovers must not stop the reconciler itself."""
+    monkeypatch.setenv("CLIP_URL_TTL_SECONDS", "86400")
+    monkeypatch.setenv("CLIP_REFRESH_SECONDS", "86400")
+    assert rec.Settings.from_env().clip_links is False
+
+
+def test_blank_clip_signer_credentials_become_none(monkeypatch):
+    monkeypatch.setenv("CLIP_AWS_ACCESS_KEY_ID", "   ")
+    monkeypatch.setenv("CLIP_AWS_SECRET_ACCESS_KEY", "")
+    s = rec.Settings.from_env()
+    assert s.clip_aws_access_key_id is None and s.clip_aws_secret_access_key is None
 
 
 def test_settings_is_immutable():
