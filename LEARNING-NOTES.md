@@ -3,14 +3,19 @@
 A record of what we investigated, what we found, and what it all means.
 Written for someone coming from Salesforce/Apex into Python, SQL, and services.
 
+> For the full project history — what was built, PR by PR, and why — start with
+> **`PROJECT-GUIDE.md`**. This file is the raw session record behind it.
+
 ---
 
 ## 1. What this project is
 
 `reconciler.py` watches Fregata (a native macOS build of Frigate NVR) for person
 detections at the front door, finds the video segments that cover each detection,
-and uploads them to S3. It is a single 389-line Python file with two dependencies:
-`boto3` (AWS SDK) and `python-dotenv` (loads a `.env` file into environment variables).
+and uploads them to S3. It began as a single 390-line Python file with two
+dependencies — `boto3` (AWS SDK) and `python-dotenv` (loads a `.env` file into
+environment variables) — and has since grown to roughly 700 lines plus `requests`
+(the Notion sink), with a sibling `clipserver.py` serving permanent clip links.
 
 It is **not** an event handler. It is a **reconciler** — a loop that wakes up on a
 timer, asks "what happened?" and "what have I already delivered?", and closes the gap
@@ -528,158 +533,98 @@ Two consequences:
 
 ## 6. Where we are now, and what's next
 
-### Current state ✅
+> Rewritten late Aug 2026. The original version of this section was frozen at the
+> pre-Notion, `DRY_RUN=true` stage. `PROJECT-GUIDE.md` tells the full story since.
 
-- Repo cloned to the Mac Mini, on `main`, venv active
-- `.gitignore` fixed, `.env` written by hand with your real values
-- Dry run **clean**: 312 events, 1,891 distinct files, 21 GB, zero mangled keys, zero errors
-- Decision made: **AWS S3** (you have credits)
+### Current state
 
-Your working `.env`:
+- **PRs #1–#4 are merged.** The Python reconciler replaced the Node.js version
+  (#1); the Notion sink plus the `.env.example` and `.gitignore` fixes landed
+  (#2); the test suite and `CODE-REVIEW.md` landed (#3); the sink was hardened
+  before first live contact (#4).
+- **The Notion sink is live-capable and hardened.** Per-sink failure isolation (a
+  Notion failure can no longer mark S3-complete events as failed), the
+  data-source API shape resolved at runtime, `NOTION_INCLUDE_PERSON=false` by
+  default so no real name is published without an explicit opt-in, and an
+  attempts budget (`NOTION_MAX_ATTEMPTS`) charged only for the event's own
+  non-429 4xxes and refunded on 429/5xx/network errors — so neither one dead
+  event nor one outage can retire the backlog.
+- **PR #5 is open (branch `clip-links`).** Every Notion page gets a permanent
+  `Clip` URL — `PUBLIC_BASE_URL/clip/<event_id>` — which the new `clipserver.py`
+  resolves at click time into a 5-minute presigned S3 URL, behind
+  `tailscale serve` so the link only works on the tailnet. The tests caught that
+  presigning was silently falling back to SigV2, which the bucket's region
+  (`ap-southeast-1`) rejects outright; the S3 client is now pinned to SigV4.
+  This makes one claim in the original version of this section stale: the code
+  *can* now mint time-limited access to objects — that is the clip server's whole
+  job. "Block Public Access: ON" remains correct regardless.
+- **This branch (`notion-clip-backfill`) closes PR #5's known limit** — pages
+  synced before clip links existed would otherwise never gain the link, because
+  `sync_notion` short-circuits on `synced_at`. `notion_delivery` grows
+  `clip_synced_at` and `clip_attempts` (via the same `ALTER TABLE` migration
+  pattern as `attempts`), and a new `backfill_clip()` PATCHes the Clip URL onto
+  already-synced pages — the program's first page-update path — under the same
+  pre-charge / blame / refund rules as page creation. `status` now reports
+  `clip_synced`, `clip_pending` and `clip_gave_up`.
+- **Tests: 231 passed, 11 xfailed** (~22 s). The 11 remaining strict xfails are
+  still-open defects from `CODE-REVIEW.md`, each asserting the correct behaviour
+  so a fix turns the suite red until its marker is removed.
 
-```
-FREGATA_DB_PATH=/Users/swarm/Fregata/config/frigate.db
-FREGATA_RECORDINGS_DIR=/Users/swarm/Fregata/media/recordings
-STATE_DB_PATH=/Users/swarm/<your-repo-path>/reconciler-state.db
-CAMERA=door_camera
-LABEL=person
-DRY_RUN=true
-UPLOAD_EVENT_MANIFEST=false
-```
+### What the repo cannot tell you
 
-### Next — create the bucket
+Whether the live run has actually happened. `.env` and `reconciler-state.db` are
+untracked (correctly), so nothing in git records whether the 21 GB backfill has
+run, whether the 312 Notion pages exist, or whether launchd is loaded. The dry
+run was verified clean; the live cutover is **not verifiable from here**.
+`python3 reconciler.py status` on the Mac Mini is the source of truth —
+`events_complete`, `notion_synced` and `clip_synced` should converge on the same
+number.
 
-Create it, then set three things **before** the first upload:
+### Still worth reading before (or after) going live
 
-- **Block Public Access: ON.** Nothing in the code can make an object public (no ACLs, no
-  presigning), so any exposure would come from bucket settings alone.
-- **Versioning: OFF.** Segments shared between overlapping events get PUT twice under the
-  same key — harmless without versioning, silent growth with it.
-- **Lifecycle rule** expiring objects after 30–90 days. At 53 GB/month, this is the
-  difference between a stable bill and 640 GB/year.
+The condensed go-live sequence now lives in `PROJECT-GUIDE.md` §5 (dry run → S3
+preflight → Notion preflight → live → clip server → launchd last). Three gotchas
+from the original version of this section that remain fully true:
 
-### Next — IAM policy (minimum)
+- **IAM: `s3:GetObject` is not optional.** Every upload is followed by
+  `head_object`; a write-only policy means every upload lands and then throws,
+  so the same file re-uploads — and re-bills — every pass, forever.
+- **Rollback:** if a live pass ever lands objects under `external/` keys, fixing
+  the config and re-running does nothing — completed events short-circuit and
+  segment rows reuse the old keys. The only clean reset is deleting
+  `reconciler-state.db*` and paying for the backfill again. (The dry run showed
+  zero such keys.)
+- **Fregata needs its own autostart.** If it doesn't survive a reboot, the
+  reconciler snapshots a frozen database, logs `Found N events` every pass,
+  uploads nothing, and exits 0 forever — a dead system that looks healthy.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "s3:PutObject",
-      "s3:GetObject",
-      "s3:AbortMultipartUpload"
-    ],
-    "Resource": "arn:aws:s3:::YOUR-BUCKET/fregata/*"
-  }]
-}
-```
+The bucket rules also stand: Block Public Access ON, Versioning OFF, and a
+lifecycle rule expiring objects after 30–90 days — at ~53 GB/month nothing else
+stops the growth, because the code deliberately deletes nothing.
 
-**`s3:GetObject` is not optional.** `upload_file` is followed immediately by `head_object`
-with no `try/except`, and HeadObject maps to `s3:GetObject`. Grant write-only and you get
-the worst failure mode: every upload lands in the bucket **and then throws** — so the
-segment row is never written and the same file re-uploads every 30 seconds, billing you
-each time.
+### Deferred backlog — updated
 
-No bucket-level ARN needed; nothing lists.
+| Status | Item | Notes |
+|---|---|---|
+| **Done** | Notion sink | PR #2, hardened in PR #4. |
+| **Done** | Per-sink delivery rows | `notion_delivery` exists — a table per sink rather than the generic `sink_delivery` this section originally sketched, but the same idea: "uploaded to S3" and "posted to Notion" fail and retry independently. |
+| **Partly done — Notion only** | Retry state and backoff (finding #7) | `attempts` + `NOTION_MAX_ATTEMPTS` with blame/refund semantics — the *attempts/terminal* half. The *backoff* half was never built anywhere: refunded failures retry every `POLL_SECONDS` with no `next_attempt_at`. Still fully **open for S3 events**: a permanently broken event (e.g. a deleted segment file) retries every poll forever. |
+| **Done — mostly** | Repo hygiene | `.env.example` rewritten (PR #2), `.gitignore` fixed. Still open in the README: the "cursor holds" claim (there is still no cursor) and the "Python 3.12+" requirement. |
+| First | Filter manifest fields, then re-enable `UPLOAD_EVENT_MANIFEST` | Unchanged, and sharper now: `NOTION_INCLUDE_PERSON` gates only Notion — the manifest still embeds the raw event row, `sub_label` included. `UPLOAD_EVENT_MANIFEST=false` is the only thing masking it. |
+| High | The watermark (finding #4) | Unchanged — every pass still rescans the full event history. |
+| Medium | Supervision redesign (finding #13) | Unchanged — the entry-logger plist still pairs `KeepAlive` with the internal `watch` loop. |
+| Medium | Log rotation | Unchanged — nothing rotates `err.log`. |
+| Medium | CI | New item: 231 tests exist and nothing runs them on push. |
+| Medium | Snapshots (JPEGs) | Unchanged — the per-event snapshot location was never verified. |
+| Low | Findings #6, #9, #11, #12 | Unchanged: dry-run state writes; `false_positive` events are archived; whole-DB copy every poll; ETag treated as a checksum. |
+| Last | Slack sink | Now an additive change: follow the `notion_delivery` pattern. |
 
-### Next — add to `.env`
-
-```
-S3_BUCKET=your-bucket-name
-S3_PREFIX=fregata
-AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-```
-
-Do **not** set `S3_ENDPOINT_URL` for AWS — leave it out entirely.
-
-### Next — preflight before pushing 21 GB
-
-See the commands section. It exercises all three API calls the program makes and gives each
-failure its own distinct error, for the cost of two objects.
-
-### Next — go live
-
-1. `DRY_RUN=false`
-2. `reconciler.py once` — this backfills all 312 events / 21 GB. At 10 Mbps up that's ~5
-   hours; at 50 Mbps ~1 hour. Start it when you don't need the bandwidth.
-3. `reconciler.py status`
-4. `reconciler.py once` **again** — the convergence test. Assert **both** that it finds the
-   same N **and** completes ~zero. Zero completions alone can mean "converged" or "found
-   nothing," which are very different.
-5. Integrity check: compare `head_object` `ContentLength` against local `stat -f%z`, then
-   download one clip and actually play it. An object listing shows a name — it passes just
-   as happily for a truncated file.
-
-### ⚠️ Rollback — read before you need it
-
-If the first live pass lands objects under `external/` keys, **fixing the config and
-re-running does nothing.** Those events are marked complete and short-circuit forever.
-Clearing only `completed_at` doesn't help either: the segment rows survive, so the code
-reuses the old ETags, skips the uploads, and writes a fresh manifest pointing at the old
-broken keys.
-
-The only clean reset:
-
-```bash
-rm reconciler-state.db reconciler-state.db-wal reconciler-state.db-shm
-```
-
-That means paying for the full backfill twice, and orphaned objects must be deleted from
-the console (your minimum IAM policy deliberately excludes `s3:DeleteObject`).
-
-Your dry run showed **zero** `external/` keys, so you're clear — but this is why that check
-mattered.
-
-### Later — launchd autostart
-
-Nothing in the plist is on the path to a first upload, so do it last. Notes:
-
-- `mkdir -p logs` first — git can't store an empty dir and launchd won't create it
-- Edit the **copy** in `~/Library/LaunchAgents`, not the repo file
-- All five `YOURUSER` occurrences share `/Users/YOURUSER/entry-logger`, so one `sed` covers them
-- `launchctl bootstrap gui/$(id -u) ...` gives real errors; `launchctl load` reports almost
-  everything as `Input/output error`
-- `out.log` staying empty is **normal** — all logging goes to stderr
-- **`bootout` is not an uninstall.** `RunAtLoad` brings it back at next login; `rm` the plist
-- FileVault blocks auto-login, so the README's power-cut plan doesn't work on an encrypted Mac
-- **Fregata needs its own autostart.** If it doesn't come back after a reboot, the reconciler
-  snapshots a frozen database, logs `Found N events` every 30s, uploads nothing, and exits 0
-  forever — a dead system that looks perfectly healthy
-
-### Deferred backlog
-
-| Priority | Item |
-|---|---|
-| First | Filter manifest fields, then re-enable `UPLOAD_EVENT_MANIFEST` |
-| First | Repo hygiene — rewrite `.env.example`, fix README (`cp .env.example .env`, "Python 3.12+", the "cursor holds" claim) |
-| High | The watermark (finding #4) |
-| High | Retry state and backoff (finding #7) |
-| Medium | Supervision redesign (finding #13) |
-| Medium | Log rotation — nothing rotates `err.log` |
-| Medium | Snapshots — the feature you thought you had. Verify your layout first |
-| Low | Findings #6, #9, #11, #12 |
-| Last | Notion and Slack sinks — with **per-sink delivery rows from the start** |
-
-On that last one: `completed_at` can't stay a single flag once you have multiple
-destinations, because "uploaded to S3" and "posted to Notion" fail independently. If Notion
-is down, the next pass must retry Notion only — not re-upload 21 GB.
-
-```sql
-CREATE TABLE IF NOT EXISTS sink_delivery (
-  event_id     TEXT NOT NULL,
-  sink         TEXT NOT NULL,        -- 's3' | 'notion' | 'slack'
-  delivered_at REAL,
-  attempts     INTEGER NOT NULL DEFAULT 0,
-  last_error   TEXT,
-  PRIMARY KEY(event_id, sink)
-);
-```
-
-Design this in from the start. Retrofitting after hard-coding a single completion flag is
-genuinely painful.
+The design note that closed the original version of this table — one completion
+flag cannot express two sinks' independent failure — proved out exactly as
+written. `notion_delivery` is what let PR #4 isolate a Notion outage from 21 GB
+of completed S3 work, and this branch's `clip_*` columns are the same move
+repeated one level down: the Clip link fails and retries independently of the
+page it lives on.
 
 ---
 
