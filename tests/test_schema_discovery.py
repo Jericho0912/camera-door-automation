@@ -166,12 +166,9 @@ def test_snapshot_copies_recordings_too(tmp_path):
         snap.unlink(missing_ok=True)
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=(
-    "snapshot_db creates its temp file before the backup and only unlinks it on "
-    "the caller's success path. A corrupt or locked source DB leaks a temp file "
-    "per poll — every 30s under `watch`, forever."))
 def test_failed_snapshot_leaves_no_temp_file(tmp_path, monkeypatch):
+    """A corrupt or locked source DB must not leak a snapshot — `watch` would
+    recreate the leak every 30s until the disk fills."""
     spool = tmp_path / "spool"
     spool.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(spool))

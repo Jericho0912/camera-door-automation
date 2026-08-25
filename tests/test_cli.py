@@ -154,6 +154,19 @@ def test_run_once_cleans_up_even_when_an_event_fails(source_with, use_session_s3
     assert list(spool.iterdir()) == []
 
 
+def test_run_once_ends_with_the_clip_refresh_pass(source_with, use_session_s3, monkeypatch):
+    """Deliveries first, links second: a slow Notion day must not delay footage.
+    The ORDER is the property — a refresh moved ahead of the event loop would pass
+    a call-count check while putting Notion on the delivery critical path."""
+    order = []
+    monkeypatch.setattr(rec, "process_event", lambda *a, **k: order.append("deliver"))
+    monkeypatch.setattr(rec, "refresh_clip_links", lambda *a, **k: order.append("refresh"))
+    settings = source_with(events=[make_event(id="e1")],
+                           recordings=[seg_row("door_camera/seg-1.mp4")])
+    rec.run_once(settings)
+    assert order == ["deliver", "refresh"]
+
+
 def test_run_once_is_idempotent_across_passes(source_with, use_session_s3, segment_file):
     """`watch` calls this every POLL_SECONDS; pass two must be a no-op."""
     segment_file("door_camera/seg-1.mp4")
@@ -229,7 +242,8 @@ def test_status_on_a_fresh_install(settings_factory, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out == {"events_seen": 0, "events_complete": 0, "events_failed": 0,
                    "segments_uploaded": 0, "notion_synced": 0, "notion_failed": 0,
-                   "notion_gave_up": 0, "dry_run": False}
+                   "notion_gave_up": 0, "clip_fresh": 0, "clip_stale": 0,
+                   "clip_gave_up": 0, "dry_run": False}
 
 
 def test_status_counts_each_category(source_with, use_session_s3, segment_file, capsys):
@@ -296,6 +310,34 @@ def test_status_creates_the_state_db_if_absent(settings_factory, capsys):
 
 
 # --------------------------------------------------------------------------
+# clips-reset
+# --------------------------------------------------------------------------
+
+def test_clips_reset_clears_clip_state_on_synced_rows_only(settings_factory, capsys):
+    settings = settings_factory()
+    state = rec.open_state(settings.state_db)
+    state.execute("INSERT INTO notion_delivery(event_id,page_id,synced_at,clip_signed_at,clip_attempts,updated_at)"
+                  " VALUES('synced','p',1,2,5,0)")
+    state.execute("INSERT INTO notion_delivery(event_id,attempts,clip_attempts,updated_at)"
+                  " VALUES('unsynced',5,3,0)")
+    state.commit()
+    state.close()
+
+    assert rec.clips_reset(settings) == 0
+    assert "1 synced page" in capsys.readouterr().out
+
+    state = rec.open_state(settings.state_db)
+    try:
+        synced = state.execute("SELECT * FROM notion_delivery WHERE event_id='synced'").fetchone()
+        unsynced = state.execute("SELECT * FROM notion_delivery WHERE event_id='unsynced'").fetchone()
+    finally:
+        state.close()
+    assert synced["clip_signed_at"] is None and synced["clip_attempts"] == 0
+    assert unsynced["clip_attempts"] == 3, "no page yet — nothing to re-sign"
+    assert unsynced["attempts"] == 5, "the creation budget is not clip state"
+
+
+# --------------------------------------------------------------------------
 # main / argument handling
 # --------------------------------------------------------------------------
 
@@ -311,6 +353,7 @@ def cli(monkeypatch, settings_factory):
 
 @pytest.mark.parametrize("command,target", [
     ("inspect", "inspect"), ("once", "run_once"), ("status", "status"),
+    ("clips-reset", "clips_reset"),
 ])
 def test_each_command_dispatches(monkeypatch, cli, command, target):
     called = []
