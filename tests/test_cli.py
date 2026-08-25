@@ -155,13 +155,16 @@ def test_run_once_cleans_up_even_when_an_event_fails(source_with, use_session_s3
 
 
 def test_run_once_ends_with_the_clip_refresh_pass(source_with, use_session_s3, monkeypatch):
-    """Deliveries first, links second: a slow Notion day must not delay footage."""
-    called = []
-    monkeypatch.setattr(rec, "refresh_clip_links",
-                        lambda state, client, settings: called.append(settings))
-    settings = source_with()
+    """Deliveries first, links second: a slow Notion day must not delay footage.
+    The ORDER is the property — a refresh moved ahead of the event loop would pass
+    a call-count check while putting Notion on the delivery critical path."""
+    order = []
+    monkeypatch.setattr(rec, "process_event", lambda *a, **k: order.append("deliver"))
+    monkeypatch.setattr(rec, "refresh_clip_links", lambda *a, **k: order.append("refresh"))
+    settings = source_with(events=[make_event(id="e1")],
+                           recordings=[seg_row("door_camera/seg-1.mp4")])
     rec.run_once(settings)
-    assert called == [settings]
+    assert order == ["deliver", "refresh"]
 
 
 def test_run_once_is_idempotent_across_passes(source_with, use_session_s3, segment_file):

@@ -68,6 +68,13 @@ class Settings:
                 "CLIP_REFRESH_SECONDS must be smaller than CLIP_URL_TTL_SECONDS: links are "
                 "re-signed only once they are older than the refresh age, so a refresh age "
                 "at or past the TTL guarantees every link in Notion dies before renewal")
+        clip_key_id = os.getenv("CLIP_AWS_ACCESS_KEY_ID", "").strip() or None
+        clip_secret = os.getenv("CLIP_AWS_SECRET_ACCESS_KEY", "").strip() or None
+        if bool(clip_key_id) != bool(clip_secret):
+            raise ValueError(
+                "CLIP_AWS_ACCESS_KEY_ID and CLIP_AWS_SECRET_ACCESS_KEY must be set together: "
+                "with only one, clip links would silently be signed by the main upload "
+                "credentials and deactivating the dedicated key would revoke nothing")
         return Settings(
             source_db=Path(os.path.expanduser(os.getenv("FREGATA_DB_PATH", "~/Fregata/config/frigate.db"))),
             recordings_dir=Path(os.path.expanduser(os.getenv("FREGATA_RECORDINGS_DIR", "~/Fregata/media/recordings"))),
@@ -95,8 +102,8 @@ class Settings:
             clip_links=clip_links,
             clip_url_ttl=clip_url_ttl,
             clip_refresh_seconds=clip_refresh_seconds,
-            clip_aws_access_key_id=os.getenv("CLIP_AWS_ACCESS_KEY_ID", "").strip() or None,
-            clip_aws_secret_access_key=os.getenv("CLIP_AWS_SECRET_ACCESS_KEY", "").strip() or None,
+            clip_aws_access_key_id=clip_key_id,
+            clip_aws_secret_access_key=clip_secret,
         )
 
 
@@ -330,10 +337,13 @@ class NotionError(RuntimeError):
 
     @property
     def blames_this_event(self) -> bool:
-        # A 4xx that is not a rate limit means Notion rejected THIS page — bad property, bad
-        # value. Anything else (429, 5xx, timeout, connection error) is the service or the
-        # network, and must not count against one event's attempt budget.
-        return self.status is not None and 400 <= self.status < 500 and self.status != 429
+        # A 4xx that is not a rate limit and not an auth failure means Notion rejected THIS
+        # page — bad property, bad value, deleted page. 401/403 are the token or the
+        # integration's permissions: global, never one page's fault, so a rotated token
+        # cannot burn the whole backlog's budget. Anything else (429, 5xx, timeout,
+        # connection error) is the service or the network, and is not charged either.
+        return (self.status is not None and 400 <= self.status < 500
+                and self.status not in (401, 403, 429))
 
 
 def notion_request(method: str, path: str, settings: Settings, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -433,7 +443,7 @@ def record_notion_error(state: sqlite3.Connection, event_id: str, exc: Exception
 # --------------------------------------------------------------------------
 
 CLIP_REFRESH_BATCH = 25       # rows per pass: drains a 312-page backlog in minutes
-CLIP_PATCH_SPACING = 0.34     # seconds between PATCHes: <1 req/s of Notion's ~3
+CLIP_PATCH_SPACING = 0.5      # seconds between PATCHes: ~2 req/s of Notion's ~3 rps budget
 
 CLIP_PAGE = """<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -508,14 +518,20 @@ def warn_if_presign_capped(settings: Settings) -> None:
                     settings.clip_url_ttl)
 
 
-def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer, settings: Settings) -> None:
+def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer, settings: Settings) -> tuple[bool, str | None]:
     """Sign a fresh viewer page for one event and PATCH its URL into Notion.
 
     Shares the creation path's temperament: never raises, never touches synced_at, and
-    budgets failures with the same blame rules — a non-429 4xx is this page's fault and
-    charges clip_attempts; 429/5xx/network says nothing and is refunded. Unlike the
-    creation budget, clip_attempts resets to 0 on success: refresh recurs forever, so a
-    lifetime budget would eventually retire every row over accumulated bad luck.
+    budgets failures with the same blame rules — a page-level 4xx is this page's fault
+    and charges clip_attempts; 401/403/429/5xx/network says nothing about the page and
+    is refunded. Unlike the creation budget, clip_attempts resets to 0 on success:
+    refresh recurs forever, so a lifetime budget would eventually retire every row over
+    accumulated bad luck.
+
+    Returns (continue_batch, page_url). continue_batch is False when the failure was
+    service-level (refunded), so the caller can abort the pass instead of burning
+    minutes of the delivery loop on rows that will all fail the same way; page_url is
+    set only on success, for the caller's once-per-pass click-time verification.
     """
     event_id = row["event_id"]
     clip_attempts = int(row["clip_attempts"])
@@ -532,7 +548,7 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
                             RuntimeError(f"clip link: no delivered segments recorded for event {event_id}"))
         LOG.warning("Clip link found no delivered segments for event %s (attempt %s/%s)",
                     event_id, clip_attempts + 1, settings.notion_max_attempts)
-        return
+        return True, None
 
     page_id = row["page_id"]
     if page_id is None:
@@ -549,7 +565,7 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
             # it but charge nothing, mirroring the blame semantics of the creation path.
             record_notion_error(state, event_id, exc)
             LOG.warning("Clip link page lookup failed for event %s; no attempt charged: %s", event_id, exc)
-            return
+            return False, None
         if page_id is None:
             # The lookup ran and found nothing: a synced row whose page cannot be found
             # will never succeed, so this IS the event's fault — charge the attempt.
@@ -559,14 +575,19 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
                                 RuntimeError(f"clip link: no Notion page found for event {event_id}"))
             LOG.warning("Clip link found no page for event %s (attempt %s/%s)",
                         event_id, clip_attempts + 1, settings.notion_max_attempts)
-            return
+            return True, None
 
     # Pre-charge the attempt before any network call, consistent with the creation path.
     # put_object and PATCH are both idempotent, so a crash here costs one attempt — which
     # the next success refunds wholesale by resetting the counter — never a duplicate.
-    # page_id rides along so an id recovered by the lookup above survives a failure.
-    state.execute("UPDATE notion_delivery SET page_id=?,clip_attempts=?,updated_at=? WHERE event_id=?",
-                  (page_id, clip_attempts + 1, time.time(), event_id))
+    # page_id rides along so an id recovered by the lookup above survives a failure. The
+    # provisional last_error is what a kill-window death leaves behind: a charge at the
+    # budget boundary retires the row, and without this stamp status() would show a
+    # retired row with no explanation. Success clears it; a caught failure overwrites it.
+    state.execute("UPDATE notion_delivery SET page_id=?,clip_attempts=?,last_error=?,updated_at=? WHERE event_id=?",
+                  (page_id, clip_attempts + 1,
+                   f"clip refresh interrupted mid-flight (attempt {clip_attempts + 1}/{settings.notion_max_attempts})",
+                   time.time(), event_id))
     state.commit()
     try:
         videos = [(k.rsplit("/", 1)[-1], presign_get(signer, settings, k)) for k in keys]
@@ -582,14 +603,16 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
         # Deliberately NOT re-raised: the page itself is fine, only its link is stale.
         blamed = isinstance(exc, NotionError) and exc.blames_this_event
         if not blamed:
-            # Refund: a 429, 5xx, dropped connection or S3 hiccup says nothing about
-            # whether this page will ever accept a Clip URL.
+            # Refund: a 401/403/429, 5xx, dropped connection or S3 hiccup says nothing
+            # about whether this page will ever accept a Clip URL.
             state.execute("UPDATE notion_delivery SET clip_attempts=? WHERE event_id=?",
                           (clip_attempts, event_id))
         record_notion_error(state, event_id, exc)
         LOG.warning("Clip link failed for event %s (attempt %s): %s",
                     event_id, f"{clip_attempts + 1}/{settings.notion_max_attempts}" if blamed else "not charged", exc)
-        return
+        # A refunded failure is the service or the network: the rest of the batch would
+        # fail identically, and each row costs real seconds of the delivery loop.
+        return blamed, None
     now = time.time()
     state.execute("""UPDATE notion_delivery
                         SET page_id=?,clip_signed_at=?,clip_attempts=0,last_error=NULL,updated_at=?
@@ -597,6 +620,34 @@ def refresh_one_clip(row: sqlite3.Row, state: sqlite3.Connection, client, signer
                   (page_id, now, now, event_id))
     state.commit()
     LOG.info("Clip link refreshed on page %s for event %s", page_id, event_id)
+    return True, page_url
+
+
+def verify_clip_url(url: str, state: sqlite3.Connection, event_id: str) -> None:
+    """Click-time check of a freshly signed page, once per pass.
+
+    Presigning is a purely local computation: a wrong AWS_REGION, a deactivated or
+    under-privileged signing key, or an SSE-KMS bucket all produce links that sign
+    fine and then 400/403 in the browser — with uploads still succeeding, so nothing
+    else surfaces it. One real GET turns that whole failure class into a CLIP FAILED
+    line instead of a success that lies.
+    """
+    try:
+        resp = requests.get(url, timeout=15, stream=True)
+        status = resp.status_code
+        resp.close()
+    except Exception as exc:
+        LOG.info("Could not verify the freshly signed clip link for %s (%s); "
+                 "spot-check one Clip link in a browser", event_id, exc)
+        return
+    if status != 200:
+        err = RuntimeError(
+            f"clip link verification failed: HTTP {status} fetching the page just signed for "
+            f"event {event_id} — presigning cannot detect a wrong AWS_REGION (must match the "
+            "bucket's region) or a bad/under-privileged signing key; fix the config, then run "
+            "clips-reset")
+        record_notion_error(state, event_id, err)
+        LOG.warning("%s", err)
 
 
 def refresh_clip_links(state: sqlite3.Connection, client, settings: Settings) -> None:
@@ -606,7 +657,9 @@ def refresh_clip_links(state: sqlite3.Connection, client, settings: Settings) ->
     retention has evicted the source events. NULL clip_signed_at sorts before every
     real timestamp under ASC, so the backlog and brand-new pages always beat routine
     re-signs; the batch cap and spacing keep the initial heal under Notion's rate
-    limit and off the critical path of actual deliveries.
+    limit and off the critical path of actual deliveries. A service-level failure
+    aborts the pass: the remaining rows would fail identically, each burning real
+    seconds while the door-camera deliveries of the NEXT pass wait behind them.
     """
     if settings.dry_run or not settings.clip_links or not settings.notion_token \
             or not settings.notion_database_id or not settings.bucket:
@@ -623,10 +676,18 @@ def refresh_clip_links(state: sqlite3.Connection, client, settings: Settings) ->
            AND n.clip_attempts < ?
          ORDER BY n.clip_signed_at ASC
          LIMIT ?""", (cutoff, settings.notion_max_attempts, CLIP_REFRESH_BATCH)).fetchall()
+    verified = False
     for i, row in enumerate(rows):
         if i:
             time.sleep(CLIP_PATCH_SPACING)
-        refresh_one_clip(row, state, client, signer, settings)
+        keep_going, page_url = refresh_one_clip(row, state, client, signer, settings)
+        if page_url and not verified:
+            verify_clip_url(page_url, state, str(row["event_id"]))
+            verified = True
+        if not keep_going:
+            LOG.warning("Aborting the clip refresh pass after a service-level failure; "
+                        "%d row(s) deferred to the next poll", len(rows) - i - 1)
+            return
 
 
 def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, state: sqlite3.Connection, settings: Settings) -> None:

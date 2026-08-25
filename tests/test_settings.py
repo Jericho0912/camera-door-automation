@@ -78,6 +78,15 @@ def test_blank_clip_signer_credentials_become_none(monkeypatch):
     assert s.clip_aws_access_key_id is None and s.clip_aws_secret_access_key is None
 
 
+@pytest.mark.parametrize("var", ["CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY"])
+def test_a_half_configured_clip_signer_is_rejected(monkeypatch, var):
+    """One of the pair alone would silently sign with the main upload credentials —
+    and deactivating the dedicated key would then revoke nothing."""
+    monkeypatch.setenv(var, "value")
+    with pytest.raises(ValueError):
+        rec.Settings.from_env()
+
+
 def test_settings_is_immutable():
     s = rec.Settings.from_env()
     with pytest.raises(Exception):

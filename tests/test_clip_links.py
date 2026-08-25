@@ -229,17 +229,68 @@ def test_a_schema_400_charges_until_terminal_then_goes_quiet(http, s3, state_db,
     assert clip_row(state_db)["clip_signed_at"] is None
 
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503])
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 502, 503])
 def test_service_trouble_is_refunded(http, s3, state_db, clip_settings, status):
+    """401/403 included: a rotated token or unshared integration is the workspace's
+    problem, and must not burn the backlog's budget page by page."""
     seed(state_db, s3, clip_attempts=2)
     http.add(responses.PATCH, f"{PAGES}/p1", json={}, status=status)
 
     rec.refresh_clip_links(state_db, s3, clip_settings)
 
     row = clip_row(state_db)
-    assert row["clip_attempts"] == 2, "a 429/5xx says nothing about this page"
+    assert row["clip_attempts"] == 2, "a 401/403/429/5xx says nothing about this page"
     assert row["clip_signed_at"] is None
     assert row["last_error"]
+
+
+def test_a_service_failure_aborts_the_pass(http, s3, state_db, clip_settings):
+    """During an outage every row fails identically, each burning real seconds while
+    the next pass's deliveries wait — one refunded failure ends the batch."""
+    for i in range(3):
+        seed(state_db, s3, event_id=f"e{i}", page_id=f"p{i}")
+        http.add(responses.PATCH, f"{PAGES}/p{i}", json={}, status=503)
+
+    rec.refresh_clip_links(state_db, s3, clip_settings)
+    assert len(patches(http)) == 1, "the remaining rows must be deferred to the next poll"
+
+
+def test_a_page_level_failure_does_not_abort_the_pass(http, s3, state_db, clip_settings):
+    """One deleted page or bad property is that page's problem; its neighbours still refresh."""
+    for i in range(3):
+        seed(state_db, s3, event_id=f"e{i}", page_id=f"p{i}")
+        http.add(responses.PATCH, f"{PAGES}/p{i}", json={}, status=400)
+
+    rec.refresh_clip_links(state_db, s3, clip_settings)
+    assert len(patches(http)) == 3
+
+
+def test_patches_are_paced(http, s3, state_db, clip_settings, monkeypatch):
+    slept = []
+    monkeypatch.setattr(rec.time, "sleep", lambda s: slept.append(s))
+    for i in range(3):
+        seed(state_db, s3, event_id=f"e{i}", page_id=f"p{i}")
+        http.add(responses.PATCH, f"{PAGES}/p{i}", json={"id": f"p{i}"}, status=200)
+
+    rec.refresh_clip_links(state_db, s3, clip_settings)
+    assert slept == [rec.CLIP_PATCH_SPACING] * 2, "spacing between rows, none before the first"
+
+
+def test_a_kill_mid_refresh_leaves_a_diagnosis(http, s3, state_db, clip_settings, monkeypatch):
+    """SIGKILL/power loss between the pre-charge and the outcome cannot refund; at the
+    budget boundary that retires the row, so the charge must carry its own explanation."""
+    seed(state_db, s3, clip_attempts=4)
+
+    def die(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(rec, "notion_request", die)
+
+    with pytest.raises(KeyboardInterrupt):
+        rec.refresh_clip_links(state_db, s3, clip_settings)
+
+    row = clip_row(state_db)
+    assert row["clip_attempts"] == 5, "the pre-charge is what a crash leaves behind"
+    assert "interrupted mid-flight" in row["last_error"]
 
 
 def test_a_dropped_connection_is_refunded(http, s3, state_db, clip_settings):
@@ -352,6 +403,75 @@ def test_the_dedicated_signer_is_used_only_when_configured(settings_factory):
         clip_aws_access_key_id="AKIAEXAMPLE", clip_aws_secret_access_key="shhh"))
     assert signer is not None
     assert signer.meta.config.signature_version == "s3v4"
+
+
+# --------------------------------------------------------------------------
+# click-time verification — presigning is local and cannot see a wrong region
+# --------------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, status):
+        self.status_code = status
+
+    def close(self):
+        pass
+
+
+def test_verification_flags_a_dead_link(state_db, monkeypatch):
+    monkeypatch.setattr(rec.requests, "get", lambda url, timeout, stream: _Resp(400))
+    rec.verify_clip_url("https://s3/x", state_db, "e1")
+    row = clip_row(state_db, "e1")
+    assert "verification failed: HTTP 400" in row["last_error"]
+    assert "AWS_REGION" in row["last_error"], "the message must name the likely cause"
+
+
+def test_verification_success_records_nothing(state_db, monkeypatch):
+    monkeypatch.setattr(rec.requests, "get", lambda url, timeout, stream: _Resp(200))
+    rec.verify_clip_url("https://s3/x", state_db, "e1")
+    assert clip_row(state_db, "e1") is None
+
+
+def test_verification_is_silent_when_it_cannot_reach_s3(state_db, monkeypatch):
+    def offline(url, timeout, stream):
+        raise OSError("no route")
+    monkeypatch.setattr(rec.requests, "get", offline)
+    rec.verify_clip_url("https://s3/x", state_db, "e1")
+    assert clip_row(state_db, "e1") is None, "an offline check must not invent a failure"
+
+
+# --------------------------------------------------------------------------
+# migration — the highest-blast-radius change: an existing install's state DB
+# --------------------------------------------------------------------------
+
+def test_an_old_shape_state_db_gains_the_clip_columns(settings_factory):
+    import sqlite3
+    settings = settings_factory()
+    settings.state_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(settings.state_db)
+    conn.executescript("""
+      CREATE TABLE notion_delivery (
+        event_id TEXT PRIMARY KEY,
+        page_id TEXT,
+        synced_at REAL,
+        last_error TEXT,
+        updated_at REAL NOT NULL
+      );
+    """)
+    conn.execute("INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at) VALUES('old','p',1,1)")
+    conn.commit()
+    conn.close()
+
+    state = rec.open_state(settings.state_db)
+    try:
+        row = state.execute(
+            "SELECT attempts, clip_signed_at, clip_attempts FROM notion_delivery WHERE event_id='old'").fetchone()
+        # NULL clip_signed_at at 0 attempts is exactly what makes the pre-feature
+        # backlog eligible for its first link once CLIP_LINKS is enabled.
+        assert row["attempts"] == 0
+        assert row["clip_signed_at"] is None
+        assert row["clip_attempts"] == 0
+    finally:
+        state.close()
 
 
 # --------------------------------------------------------------------------

@@ -360,6 +360,18 @@ def test_a_rejected_page_does_cost_an_attempt(http, state_db, notion_settings):
         "SELECT attempts FROM notion_delivery WHERE event_id='e1'").fetchone()["attempts"] == 1
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_failure_costs_no_attempt(http, state_db, notion_settings, status):
+    """401/403 is the token or the integration's permissions — global, never one
+    event's fault. A rotated token must not burn the backlog's budget."""
+    http.add(responses.POST, PAGES, json={"message": "unauthorized"}, status=status)
+    rec.sync_notion(make_event(id="e1"), "k", 1, state_db, notion_settings)
+
+    row = state_db.execute("SELECT attempts,last_error FROM notion_delivery WHERE event_id='e1'").fetchone()
+    assert row["attempts"] == 0, "the event must still be syncable once the token is fixed"
+    assert row["last_error"] is not None
+
+
 def test_person_is_withheld_unless_explicitly_enabled(settings_factory):
     """sub_label is a real person's name. Publishing it to Notion is opt-in."""
     off = settings_factory(notion_include_person=False)
