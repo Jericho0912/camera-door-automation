@@ -9,3 +9,4 @@ __pycache__/
 *.db-shm
 logs/
 skills-lock.json
+.coverage
