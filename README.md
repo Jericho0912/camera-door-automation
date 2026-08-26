@@ -60,6 +60,7 @@ The reconciler takes one of the following commands:
 - `once`: Runs a single reconciliation pass over the Fregata database.
 - `watch`: Runs `once` in an infinite loop, sleeping for `POLL_SECONDS` between passes.
 - `status`: Outputs the current delivery status, including completed/failed events and uploaded segments.
+- `slack-summary`: Posts the Slack unknown-visitor summary immediately, ignoring the schedule (with `DRY_RUN=true` it prints the message instead of posting).
 
 Example:
 
@@ -106,6 +107,35 @@ Know what you are enabling:
 After fixing a broken setup (Clip property was missing, or the signing key was
 rotated), run `python3 reconciler.py clips-reset` to re-sign everything.
 
+## Slack end-of-day summary (optional)
+
+With `SLACK_WEBHOOK_URL` set, the watch loop posts **one message per day** at
+`SLACK_SUMMARY_TIME` (local, default 21:00) listing every event since the previous
+summary that face recognition matched to nobody. There are no per-event pings — the
+door camera should not own your notifications — and quiet days post nothing unless
+`SLACK_SUMMARY_ON_EMPTY=true`.
+
+Design choices worth knowing:
+
+- **Names never reach Slack.** The summary is exactly the events *without* a
+  recognized person, so `NOTION_INCLUDE_PERSON` is irrelevant to it.
+- **No presigned clip URLs in Slack.** Those are bearer tokens and Slack retains
+  messages indefinitely; each line links to the event's Notion page instead, which
+  is access-controlled and where the clip already lives.
+- **Windows are gap-free, not calendar days.** Each summary covers everything
+  recorded since the previous one, so an event at 23:50 lands in the next evening's
+  message rather than vanishing. If the Mac is asleep at summary time, the first
+  pass after it wakes posts one combined catch-up message.
+- **Enabling it does not dump history.** The first pass after configuring the
+  webhook only opens the window; the first real summary arrives the next scheduled
+  time.
+- A failed post (Slack down, webhook revoked) retries on the next poll without
+  losing the window. `status` reports the last summary time as
+  `slack_last_summary`.
+
+Test the pipe end-to-end with `python3 reconciler.py slack-summary`, which posts
+immediately (covering the last 24 h if no summary was ever sent).
+
 ## Dependency register
 
 Everything the service needs, declared. Nothing here should live only in someone's shell history.
@@ -114,4 +144,5 @@ Everything the service needs, declared. Nothing here should live only in someone
 |---|---|---|
 | Fregata DB accessible | `FREGATA_DB_PATH` | Poll fails, cursor holds |
 | S3 credentials | `.env` | Upload retries with backoff |
+| Slack webhook valid | `SLACK_WEBHOOK_URL` | Summary retries next poll; deliveries unaffected |
 | Auto-login enabled | macOS setting | **Nothing restarts after power loss** |

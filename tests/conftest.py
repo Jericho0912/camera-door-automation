@@ -174,6 +174,10 @@ def settings_factory(tmp_path: Path, recordings_dir: Path):
             clip_refresh_seconds=432000,
             clip_aws_access_key_id=None,
             clip_aws_secret_access_key=None,
+            slack_webhook_url=None,
+            slack_summary_hour=21,
+            slack_summary_minute=0,
+            slack_summary_on_empty=False,
         )
         base.update(over)
         return rec.Settings(**base)
@@ -241,7 +245,9 @@ def _s3_client(_moto):
         upload_manifest=False, notion_token=None, notion_database_id=None,
         notion_version="v", notion_include_person=False, notion_max_attempts=5,
         clip_links=False, clip_url_ttl=604800, clip_refresh_seconds=432000,
-        clip_aws_access_key_id=None, clip_aws_secret_access_key=None))
+        clip_aws_access_key_id=None, clip_aws_secret_access_key=None,
+        slack_webhook_url=None, slack_summary_hour=21, slack_summary_minute=0,
+        slack_summary_on_empty=False))
 
 
 @pytest.fixture

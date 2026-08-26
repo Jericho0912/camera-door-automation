@@ -51,6 +51,10 @@ class Settings:
     clip_refresh_seconds: int
     clip_aws_access_key_id: str | None
     clip_aws_secret_access_key: str | None
+    slack_webhook_url: str | None
+    slack_summary_hour: int
+    slack_summary_minute: int
+    slack_summary_on_empty: bool
 
     @staticmethod
     def from_env() -> "Settings":
@@ -75,6 +79,15 @@ class Settings:
                 "CLIP_AWS_ACCESS_KEY_ID and CLIP_AWS_SECRET_ACCESS_KEY must be set together: "
                 "with only one, clip links would silently be signed by the main upload "
                 "credentials and deactivating the dedicated key would revoke nothing")
+        summary_time = os.getenv("SLACK_SUMMARY_TIME", "21:00").strip()
+        try:
+            hour_str, minute_str = summary_time.split(":")
+            slack_hour, slack_minute = int(hour_str), int(minute_str)
+            if not (0 <= slack_hour < 24 and 0 <= slack_minute < 60):
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f"SLACK_SUMMARY_TIME must be HH:MM in local 24h time, got {summary_time!r}") from None
         return Settings(
             source_db=Path(os.path.expanduser(os.getenv("FREGATA_DB_PATH", "~/Fregata/config/frigate.db"))),
             recordings_dir=Path(os.path.expanduser(os.getenv("FREGATA_RECORDINGS_DIR", "~/Fregata/media/recordings"))),
@@ -104,6 +117,10 @@ class Settings:
             clip_refresh_seconds=clip_refresh_seconds,
             clip_aws_access_key_id=clip_key_id,
             clip_aws_secret_access_key=clip_secret,
+            slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", "").strip() or None,
+            slack_summary_hour=slack_hour,
+            slack_summary_minute=slack_minute,
+            slack_summary_on_empty=b("SLACK_SUMMARY_ON_EMPTY", False),
         )
 
 
@@ -198,6 +215,10 @@ def open_state(path: Path) -> sqlite3.Connection:
         clip_attempts INTEGER NOT NULL DEFAULT 0,
         updated_at REAL NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     """)
     # CREATE TABLE IF NOT EXISTS never alters an existing table, so a state DB written by an
     # older build keeps its old shape. This only fires for those; a fresh DB is already correct.
@@ -209,8 +230,25 @@ def open_state(path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE notion_delivery ADD COLUMN clip_signed_at REAL")
     if "clip_attempts" not in table_columns(conn, "notion_delivery"):
         conn.execute("ALTER TABLE notion_delivery ADD COLUMN clip_attempts INTEGER NOT NULL DEFAULT 0")
+    # Slack summary state. Rows written by older builds keep person/recorded_at NULL, which
+    # is exactly what keeps the pre-existing backlog out of the first evening's summary.
+    if "person" not in table_columns(conn, "event_delivery"):
+        conn.execute("ALTER TABLE event_delivery ADD COLUMN person TEXT")
+    if "recorded_at" not in table_columns(conn, "event_delivery"):
+        conn.execute("ALTER TABLE event_delivery ADD COLUMN recorded_at REAL")
     conn.commit()
     return conn
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("""INSERT INTO meta(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, value))
+    conn.commit()
 
 
 def parse_json(value: Any) -> Any:
@@ -395,12 +433,19 @@ def notion_targets(settings: Settings) -> tuple[dict[str, Any], str]:
     return _NOTION_TARGETS
 
 
+def recognized_person(event: dict[str, Any]) -> str | None:
+    """The enrolled name face recognition attached to the event, or None for a stranger."""
+    sub = event.get("sub_label")
+    if isinstance(sub, str) and sub.strip():
+        return sub.strip()
+    return None
+
+
 def notion_properties(event: dict[str, Any], manifest_key: str | None, segments: int, settings: Settings) -> dict[str, Any]:
     # sub_label is a real person's name. Publishing it is opt-in, and a comma is not a legal
     # Notion select option, so strip it rather than let one enrolled name fail every run.
     if settings.notion_include_person:
-        sub = event.get("sub_label")
-        person = (sub if isinstance(sub, str) else "").replace(",", " ").strip() or "Unrecognized"
+        person = (recognized_person(event) or "").replace(",", " ").strip() or "Unrecognized"
     else:
         person = "Unrecognized"
     start = float(event["start_time"])
@@ -759,6 +804,147 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
     LOG.info("Notion page %s for event %s", page_id, event_id)
 
 
+# --------------------------------------------------------------------------
+# Slack: one end-of-day summary of the strangers the camera saw.
+#
+# No per-event pings. Once per local day, at SLACK_SUMMARY_TIME, the poll loop
+# posts a single message to an incoming webhook listing every event recorded
+# since the previous summary whose face recognition matched nobody. Names never
+# appear in it — recognized people are exactly what it excludes — and no
+# presigned clip URL is ever posted: those are bearer tokens and Slack retains
+# messages indefinitely. The Notion page link goes instead; it is
+# access-controlled and already the system's viewing surface.
+# --------------------------------------------------------------------------
+
+SLACK_SENT_AT_KEY = "slack_summary_sent_at"
+SLACK_SUMMARY_MAX_LINES = 25
+
+
+def slack_escape(text: str) -> str:
+    # Slack's markup reserves exactly these three characters; an unescaped '<' in a
+    # camera name would be parsed as a link.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notion_page_url(page_id: str) -> str:
+    return "https://www.notion.so/" + page_id.replace("-", "")
+
+
+def unknown_events_between(state: sqlite3.Connection, since: float, until: float) -> list[sqlite3.Row]:
+    # person IS NULL is only meaningful on rows this build recorded; rows from older
+    # builds have recorded_at NULL too and fall outside every window by construction.
+    return state.execute("""
+        SELECT e.event_id, e.camera, e.start_time, e.end_time, e.completed_at, n.page_id
+          FROM event_delivery e LEFT JOIN notion_delivery n ON n.event_id = e.event_id
+         WHERE e.recorded_at > ? AND e.recorded_at <= ? AND e.person IS NULL
+         ORDER BY e.start_time ASC""", (since, until)).fetchall()
+
+
+def render_slack_summary(rows: list[sqlite3.Row], now: float) -> str:
+    day = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%a %d %b")
+    if not rows:
+        return f"Door summary {day}: no unknown visitors."
+    lines = [f"Door summary {day}: {len(rows)} unknown visitor event(s)"]
+    for row in rows[:SLACK_SUMMARY_MAX_LINES]:
+        start = datetime.fromtimestamp(float(row["start_time"]), timezone.utc).astimezone()
+        end = datetime.fromtimestamp(float(row["end_time"]), timezone.utc).astimezone()
+        # The window opens at the previous summary, so it can span days — each line
+        # carries its own weekday rather than inheriting the header's.
+        parts = [f"• {start.strftime('%a %H:%M')}–{end.strftime('%H:%M')}",
+                 f"{float(row['end_time']) - float(row['start_time']):.0f}s",
+                 slack_escape(str(row["camera"]))]
+        if row["completed_at"] is None:
+            parts.append("footage not yet uploaded")
+        if row["page_id"]:
+            parts.append(f"<{notion_page_url(str(row['page_id']))}|Notion>")
+        lines.append(" · ".join(parts))
+    if len(rows) > SLACK_SUMMARY_MAX_LINES:
+        lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
+    return "\n".join(lines)
+
+
+def post_slack(settings: Settings, text: str) -> bool:
+    try:
+        resp = requests.post(settings.slack_webhook_url, json={"text": text}, timeout=15)
+    except Exception as exc:
+        LOG.warning("Slack webhook unreachable: %s", exc)
+        return False
+    if resp.status_code >= 300:
+        LOG.warning("Slack webhook rejected the summary: %s %s", resp.status_code, resp.text[:200])
+        return False
+    return True
+
+
+def summary_scheduled_epoch(now: float, settings: Settings) -> float:
+    local = datetime.fromtimestamp(now, timezone.utc).astimezone()
+    return local.replace(hour=settings.slack_summary_hour, minute=settings.slack_summary_minute,
+                         second=0, microsecond=0).timestamp()
+
+
+def maybe_send_slack_summary(state: sqlite3.Connection, settings: Settings, now: float | None = None) -> None:
+    """Post the daily summary if it is due. Never raises.
+
+    meta['slack_summary_sent_at'] is both the once-per-day marker and the left edge of
+    the next summary's window: a Mac that was asleep at summary time catches up on the
+    next pass with one message covering everything missed, and nothing recorded after
+    one summary can fall between it and the next. A failed post leaves the cursor
+    alone and retries next poll; the reverse ordering's risk (posted but unmarked
+    after a crash in between) costs one duplicate digest, accepted over silence.
+    """
+    if settings.dry_run or not settings.slack_webhook_url:
+        return
+    try:
+        now = time.time() if now is None else now
+        last = get_meta(state, SLACK_SENT_AT_KEY)
+        if last is None:
+            # First pass with Slack configured: open the window here, or the entire
+            # historical backlog would land in the first evening's message.
+            set_meta(state, SLACK_SENT_AT_KEY, str(now))
+            return
+        scheduled = summary_scheduled_epoch(now, settings)
+        if now < scheduled or float(last) >= scheduled:
+            return
+        rows = unknown_events_between(state, float(last), now)
+        if not rows and not settings.slack_summary_on_empty:
+            set_meta(state, SLACK_SENT_AT_KEY, str(now))
+            LOG.info("Slack summary: no unknown events since the last one; nothing posted")
+            return
+        if post_slack(settings, render_slack_summary(rows, now)):
+            set_meta(state, SLACK_SENT_AT_KEY, str(now))
+            LOG.info("Slack summary posted: %d unknown event(s)", len(rows))
+    except Exception:
+        # Slack is a tertiary sink; a bad cursor value or webhook surprise must never
+        # take down the delivery loop.
+        LOG.exception("Slack summary pass failed")
+
+
+def slack_summary_now(settings: Settings) -> int:
+    """Post the summary immediately, ignoring the schedule — the manual test gesture.
+
+    With no cursor yet (Slack never configured before), covers the last 24 hours.
+    """
+    state = open_state(settings.state_db)
+    try:
+        now = time.time()
+        last = get_meta(state, SLACK_SENT_AT_KEY)
+        since = float(last) if last is not None else now - 86_400.0
+        rows = unknown_events_between(state, since, now)
+        text = render_slack_summary(rows, now)
+        if settings.dry_run:
+            print("DRY RUN — nothing posted. The message would be:\n" + text)
+            return 0
+        if not settings.slack_webhook_url:
+            print("SLACK_WEBHOOK_URL is not set")
+            return 1
+        if not post_slack(settings, text):
+            return 1
+        set_meta(state, SLACK_SENT_AT_KEY, str(now))
+        print(f"Posted {len(rows)} unknown event(s) covering {utc_iso(since)} to {utc_iso(now)}")
+        return 0
+    finally:
+        state.close()
+
+
 def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_table: str, recording_cols: set[str], state: sqlite3.Connection, client, settings: Settings) -> None:
     event_id = str(event["id"])
     done = state.execute("SELECT completed_at,manifest_key FROM event_delivery WHERE event_id=?", (event_id,)).fetchone()
@@ -770,10 +956,13 @@ def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_ta
     end = float(event["end_time"]) + settings.post_roll
     segments = fetch_segments(fconn, recording_table, recording_cols, str(event["camera"]), start, end)
     now = time.time()
-    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,updated_at)
-                     VALUES(?,?,?,?,?)
-                     ON CONFLICT(event_id) DO UPDATE SET updated_at=excluded.updated_at,last_error=NULL""",
-                  (event_id, event["camera"], event["start_time"], event["end_time"], now))
+    # recorded_at is deliberately NOT in the conflict clause: it marks when this event first
+    # entered the state DB, which is what scopes it into exactly one Slack summary window.
+    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,recorded_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(event_id) DO UPDATE SET person=excluded.person,updated_at=excluded.updated_at,last_error=NULL""",
+                  (event_id, event["camera"], event["start_time"], event["end_time"],
+                   recognized_person(event), now, now))
     state.commit()
     if not segments:
         raise RuntimeError(f"No recording segments overlap event {event_id} window {utc_iso(start)} to {utc_iso(end)}")
@@ -873,6 +1062,7 @@ def run_once(settings: Settings) -> int:
         # After the deliveries, so a slow Notion day can never delay footage leaving the
         # house. New pages picked up above get their first link in this same pass.
         refresh_clip_links(state, client, settings)
+        maybe_send_slack_summary(state, settings)
         return 1 if failures else 0
     finally:
         try: fconn.close()
@@ -898,9 +1088,11 @@ def status(settings: Settings) -> int:
         clip_stale = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL AND (clip_signed_at IS NULL OR clip_signed_at < ?) AND clip_attempts < ?",
                                    (fresh_cutoff, settings.notion_max_attempts)).fetchone()[0]
         clip_gaveup = state.execute("SELECT COUNT(*) FROM notion_delivery WHERE synced_at IS NOT NULL AND clip_attempts >= ?", (settings.notion_max_attempts,)).fetchone()[0]
+        last_summary = get_meta(state, SLACK_SENT_AT_KEY)
         print(json.dumps({"events_seen": total, "events_complete": complete, "events_failed": failed, "segments_uploaded": segments,
                           "notion_synced": notion_synced, "notion_failed": notion_failed, "notion_gave_up": notion_gaveup,
                           "clip_fresh": clip_fresh, "clip_stale": clip_stale, "clip_gave_up": clip_gaveup,
+                          "slack_last_summary": utc_iso(float(last_summary)) if last_summary else None,
                           "dry_run": settings.dry_run}, indent=2))
         for row in state.execute("SELECT event_id,last_error FROM event_delivery WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10"):
             print(f"FAILED {row['event_id']}: {row['last_error']}")
@@ -934,13 +1126,14 @@ def clips_reset(settings: Settings) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reconcile Fregata events and recording segments to S3")
-    parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset"))
+    parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset", "slack-summary"))
     args = parser.parse_args()
     settings = Settings.from_env()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "inspect": return inspect(settings)
     if args.command == "status": return status(settings)
     if args.command == "clips-reset": return clips_reset(settings)
+    if args.command == "slack-summary": return slack_summary_now(settings)
     if args.command == "once": return run_once(settings)
     while True:
         try:

@@ -24,6 +24,7 @@ def clean_env(monkeypatch):
         "DRY_RUN", "UPLOAD_EVENT_MANIFEST", "NOTION_TOKEN", "NOTION_DATABASE_ID",
         "NOTION_VERSION", "CLIP_LINKS", "CLIP_URL_TTL_SECONDS", "CLIP_REFRESH_SECONDS",
         "CLIP_AWS_ACCESS_KEY_ID", "CLIP_AWS_SECRET_ACCESS_KEY",
+        "SLACK_WEBHOOK_URL", "SLACK_SUMMARY_TIME", "SLACK_SUMMARY_ON_EMPTY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -197,4 +198,25 @@ def test_live_mode_without_bucket_is_rejected_at_startup(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("S3_BUCKET", "")
     with pytest.raises(Exception):
+        rec.Settings.from_env()
+
+
+def test_slack_defaults(monkeypatch):
+    s = rec.Settings.from_env()
+    assert s.slack_webhook_url is None
+    assert (s.slack_summary_hour, s.slack_summary_minute) == (21, 0)
+    assert s.slack_summary_on_empty is False
+
+
+def test_slack_summary_time_parses(monkeypatch):
+    monkeypatch.setenv("SLACK_SUMMARY_TIME", "07:30")
+    s = rec.Settings.from_env()
+    assert (s.slack_summary_hour, s.slack_summary_minute) == (7, 30)
+
+
+@pytest.mark.parametrize("bad", ["evening", "25:00", "21:60", "21", "21:00:00", ""])
+def test_bad_slack_summary_time_crashes_at_startup(monkeypatch, bad):
+    """A typo'd time must fail loudly, not silently never send a summary."""
+    monkeypatch.setenv("SLACK_SUMMARY_TIME", bad)
+    with pytest.raises(ValueError):
         rec.Settings.from_env()

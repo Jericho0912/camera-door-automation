@@ -1,0 +1,277 @@
+"""The Slack end-of-day summary: window arithmetic, once-per-day gating, and
+what may never appear in the message (names, presigned URLs).
+
+The cursor in ``meta`` is both the dedupe marker and the left edge of the next
+window, so most tests pivot on where events' ``recorded_at`` falls relative to it.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+import responses
+
+import reconciler as rec
+from conftest import NOW
+
+WEBHOOK = "https://hooks.slack.com/services/T000/B000/XXXX"
+
+
+@pytest.fixture
+def slack_settings(settings_factory):
+    return settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
+
+
+@pytest.fixture
+def http():
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as m:
+        yield m
+
+
+def seed_event(state, event_id, *, person=None, recorded_at=NOW, camera="door_camera",
+               start=NOW, end=NOW + 20.0, completed=True):
+    state.execute("""INSERT INTO event_delivery(event_id,camera,start_time,end_time,person,recorded_at,completed_at,updated_at)
+                     VALUES(?,?,?,?,?,?,?,?)""",
+                  (event_id, camera, start, end, person, recorded_at,
+                   NOW if completed else None, NOW))
+    state.commit()
+
+
+def posted_text(http) -> str:
+    assert len(http.calls) == 1, "expected exactly one Slack post"
+    return json.loads(http.calls[0].request.body)["text"]
+
+
+def anchor(settings):
+    """A ``now`` that is past today's scheduled time, plus a cursor before it."""
+    scheduled = rec.summary_scheduled_epoch(NOW, settings)
+    return scheduled + 60.0, scheduled - 3600.0
+
+
+# --------------------------------------------------------------------------
+# Schema and bookkeeping
+# --------------------------------------------------------------------------
+
+def test_meta_roundtrip(state_db):
+    assert rec.get_meta(state_db, "k") is None
+    rec.set_meta(state_db, "k", "v1")
+    rec.set_meta(state_db, "k", "v2")
+    assert rec.get_meta(state_db, "k") == "v2"
+
+
+def test_old_state_db_gains_the_new_columns(settings_factory):
+    """A state DB written before this feature must migrate in place."""
+    path = settings_factory().state_db
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE event_delivery (
+        event_id TEXT PRIMARY KEY, camera TEXT NOT NULL, start_time REAL NOT NULL,
+        end_time REAL NOT NULL, manifest_key TEXT, completed_at REAL,
+        last_error TEXT, updated_at REAL NOT NULL)""")
+    conn.commit()
+    conn.close()
+    state = rec.open_state(path)
+    try:
+        cols = rec.table_columns(state, "event_delivery")
+        assert {"person", "recorded_at"} <= cols
+        rec.set_meta(state, "probe", "ok")
+    finally:
+        state.close()
+
+
+def test_recognized_person_extraction():
+    assert rec.recognized_person({"sub_label": "Alice"}) == "Alice"
+    assert rec.recognized_person({"sub_label": "  "}) is None
+    assert rec.recognized_person({"sub_label": None}) is None
+    assert rec.recognized_person({}) is None
+    assert rec.recognized_person({"sub_label": ["Alice", 0.9]}) is None
+
+
+# --------------------------------------------------------------------------
+# Gating: when a summary is due
+# --------------------------------------------------------------------------
+
+def test_first_pass_opens_the_window_without_posting(state_db, slack_settings, http):
+    """Enabling Slack must not dump the whole historical backlog into one message."""
+    seed_event(state_db, "old-1", recorded_at=NOW - 999.0)
+    now, _ = anchor(slack_settings)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    assert len(http.calls) == 0
+    assert rec.get_meta(state_db, rec.SLACK_SENT_AT_KEY) == str(now)
+    # ...and the pre-enable event stays out of the next summary too.
+    later = now + 60.0
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=later)
+    assert len(http.calls) == 0, "nothing new was recorded, so nothing is due to post"
+
+
+def test_not_due_before_the_scheduled_time(state_db, slack_settings, http):
+    scheduled = rec.summary_scheduled_epoch(NOW, slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(scheduled - 7200.0))
+    seed_event(state_db, "e1", recorded_at=scheduled - 3600.0)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=scheduled - 60.0)
+    assert len(http.calls) == 0
+
+
+def test_due_summary_posts_once(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", recorded_at=cursor + 60.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "door_camera" in text
+    assert rec.get_meta(state_db, rec.SLACK_SENT_AT_KEY) == str(now)
+    # A second pass the same evening is a no-op.
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now + 30.0)
+    assert len(http.calls) == 1
+
+
+def test_recognized_people_are_excluded(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "known", person="Alice", recorded_at=cursor + 10.0)
+    seed_event(state_db, "stranger", recorded_at=cursor + 20.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "Alice" not in text, "a recognized name must never reach Slack"
+
+
+def test_quiet_day_posts_nothing_but_advances_the_cursor(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "known", person="Alice", recorded_at=cursor + 10.0)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    assert len(http.calls) == 0
+    assert rec.get_meta(state_db, rec.SLACK_SENT_AT_KEY) == str(now)
+
+
+def test_on_empty_true_posts_a_zero_line(state_db, settings_factory, http):
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK,
+                                slack_summary_on_empty=True)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    assert "no unknown visitors" in posted_text(http)
+
+
+def test_failed_post_keeps_the_cursor_for_a_retry(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", recorded_at=cursor + 60.0)
+    http.add(responses.POST, WEBHOOK, body="no_service", status=500)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    assert rec.get_meta(state_db, rec.SLACK_SENT_AT_KEY) == str(cursor)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now + 30.0)
+    assert len(http.calls) == 2
+    assert rec.get_meta(state_db, rec.SLACK_SENT_AT_KEY) == str(now + 30.0)
+
+
+def test_dry_run_never_posts(state_db, settings_factory, http):
+    settings = settings_factory(dry_run=True, slack_webhook_url=WEBHOOK)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", recorded_at=cursor + 60.0)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    assert len(http.calls) == 0
+
+
+def test_summary_failure_never_raises(state_db, slack_settings, http):
+    """A corrupt cursor value must not take down the delivery loop."""
+    now, _ = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, "not-a-number")
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)  # must not raise
+    assert len(http.calls) == 0
+
+
+# --------------------------------------------------------------------------
+# Message content
+# --------------------------------------------------------------------------
+
+def test_message_lines_and_notion_link(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", recorded_at=cursor + 10.0, start=NOW, end=NOW + 42.0)
+    seed_event(state_db, "e2", recorded_at=cursor + 20.0, completed=False)
+    state_db.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                        VALUES('e1','abc-123-def',?,?)""", (NOW, NOW))
+    state_db.commit()
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    text = posted_text(http)
+    assert "2 unknown visitor" in text
+    assert "42s" in text
+    assert "<https://www.notion.so/abc123def|Notion>" in text
+    assert "footage not yet uploaded" in text
+    assert "AWSAccessKeyId" not in text and "X-Amz-" not in text
+
+
+def test_camera_names_are_slack_escaped(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", camera="door<&>cam", recorded_at=cursor + 10.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    assert "door&lt;&amp;&gt;cam" in posted_text(http)
+
+
+def test_long_days_are_truncated_with_a_count(state_db, slack_settings, http):
+    now, cursor = anchor(slack_settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    for i in range(rec.SLACK_SUMMARY_MAX_LINES + 5):
+        seed_event(state_db, f"e{i}", recorded_at=cursor + 10.0 + i)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, slack_settings, now=now)
+    text = posted_text(http)
+    assert f"{rec.SLACK_SUMMARY_MAX_LINES + 5} unknown visitor" in text
+    assert "and 5 more" in text
+
+
+# --------------------------------------------------------------------------
+# The slack-summary command
+# --------------------------------------------------------------------------
+
+def test_slack_summary_now_posts_and_marks(settings_factory, http):
+    import time as _time
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
+    state = rec.open_state(settings.state_db)
+    try:
+        # slack_summary_now runs on the real clock, and with no cursor yet it covers
+        # the last 24h — so the seeded event must sit inside that real window.
+        seed_event(state, "e1", recorded_at=_time.time() - 10.0)
+    finally:
+        state.close()
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    assert rec.slack_summary_now(settings) == 0
+    assert "1 unknown visitor" in posted_text(http)
+    state = rec.open_state(settings.state_db)
+    try:
+        assert rec.get_meta(state, rec.SLACK_SENT_AT_KEY) is not None
+    finally:
+        state.close()
+    assert len(http.calls) == 1
+
+
+def test_slack_summary_now_dry_run_prints_instead(settings_factory, http, capsys):
+    settings = settings_factory(dry_run=True, slack_webhook_url=WEBHOOK)
+    state = rec.open_state(settings.state_db)
+    try:
+        seed_event(state, "e1", recorded_at=NOW - 10.0)
+    finally:
+        state.close()
+    assert rec.slack_summary_now(settings) == 0
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert len(http.calls) == 0
+
+
+def test_slack_summary_now_without_webhook_fails(settings_factory, capsys):
+    settings = settings_factory(dry_run=False, slack_webhook_url=None)
+    assert rec.slack_summary_now(settings) == 1
+    assert "SLACK_WEBHOOK_URL" in capsys.readouterr().out
