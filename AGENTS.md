@@ -10,6 +10,8 @@ presigned clip link. Everything else in the repo supports that one file.
 - `reconciler.py` — the whole service: `Settings`, S3, Notion, clip links, CLI.
   The frozen `Settings` dataclass is the single injection seam; every function
   takes it, and the tests rely on that.
+- `ARCHITECTURE.md` — the pipeline in two diagrams: the system data flow and
+  the ER model of the Fregata tables, the state DB, and the Notion properties.
 - `.env.example` — the authoritative register of every variable the service
   reads ("anything not listed here is ignored") and the reasoning behind each
   default. Any change to configuration lands here in the same commit.
