@@ -423,3 +423,39 @@ def test_the_same_segment_shared_by_two_events_is_tracked_per_event(pipeline, se
     rows = w.state.execute("SELECT event_id FROM segment_delivery ORDER BY event_id").fetchall()
     assert [r["event_id"] for r in rows] == ["e1", "e2"]
     assert w.keys().count("fregata/recordings/door_camera/shared.mp4") == 1, "one object, not two"
+
+
+# --------------------------------------------------------------------------
+# Slack summary bookkeeping
+# --------------------------------------------------------------------------
+
+def test_records_person_and_recorded_at_for_the_slack_summary(pipeline, segment_file):
+    segment_file("door_camera/seg-1.mp4")
+    w = pipeline(
+        events=[make_event(id="known", sub_label="Alice"),
+                make_event(id="stranger", sub_label=None)],
+        recordings=[seg_row("door_camera/seg-1.mp4")],
+    )
+    for e in w.events():
+        w.run(e)
+
+    rows = {r["event_id"]: r for r in w.state.execute(
+        "SELECT event_id,person,recorded_at FROM event_delivery")}
+    assert rows["known"]["person"] == "Alice"
+    assert rows["stranger"]["person"] is None, "a stranger is the summary's whole subject"
+    assert all(r["recorded_at"] is not None for r in rows.values())
+
+
+def test_recorded_at_survives_reprocessing(pipeline, segment_file):
+    """recorded_at scopes an event into exactly one summary window; a retried
+    delivery must not shift it forward into a later window."""
+    segment_file("door_camera/seg-1.mp4")
+    w = pipeline(events=[make_event(id="e1")], recordings=[seg_row("door_camera/seg-1.mp4")])
+    event = w.events()[0]
+    w.run(event)
+    first = w.state.execute("SELECT recorded_at FROM event_delivery WHERE event_id='e1'").fetchone()[0]
+    w.state.execute("UPDATE event_delivery SET completed_at=NULL WHERE event_id='e1'")
+    w.state.commit()
+    w.run(event)
+    second = w.state.execute("SELECT recorded_at FROM event_delivery WHERE event_id='e1'").fetchone()[0]
+    assert second == first
