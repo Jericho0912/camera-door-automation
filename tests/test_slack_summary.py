@@ -275,3 +275,73 @@ def test_slack_summary_now_without_webhook_fails(settings_factory, capsys):
     settings = settings_factory(dry_run=False, slack_webhook_url=None)
     assert rec.slack_summary_now(settings) == 1
     assert "SLACK_WEBHOOK_URL" in capsys.readouterr().out
+
+
+
+# --------------------------------------------------------------------------
+# Known visitors section (SLACK_INCLUDE_KNOWN)
+# --------------------------------------------------------------------------
+
+def test_known_visitors_are_included_when_enabled(state_db, settings_factory, http):
+    """With SLACK_INCLUDE_KNOWN=true, recognized people appear in a dedicated section."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=True)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", person="Alice", recorded_at=cursor + 10.0)
+    seed_event(state_db, "e2", person="Alice", recorded_at=cursor + 20.0)
+    seed_event(state_db, "e3", person="Bob", recorded_at=cursor + 30.0)
+    seed_event(state_db, "e4", person=None, recorded_at=cursor + 40.0)  # unknown stranger
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "Known visitors: Alice (2), Bob (1)" in text
+
+
+def test_known_visitors_are_excluded_by_default(state_db, settings_factory, http):
+    """By default (SLACK_INCLUDE_KNOWN=false), recognized people never appear in Slack."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=False)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", person="Alice", recorded_at=cursor + 10.0)
+    seed_event(state_db, "e2", person=None, recorded_at=cursor + 20.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "Alice" not in text
+    assert "Known visitors" not in text
+
+
+def test_day_with_only_known_visitors_posts_when_enabled(state_db, settings_factory, http):
+    """When only known people visited and SLACK_INCLUDE_KNOWN=true, summary posts."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=True)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", person="Alice", recorded_at=cursor + 10.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    text = posted_text(http)
+    assert "no unknown visitors" in text
+    assert "Known visitors: Alice (1)" in text
+
+
+def test_day_with_only_known_visitors_quiet_by_default(state_db, settings_factory, http):
+    """When only known people visited and SLACK_INCLUDE_KNOWN=false, quiet day posts nothing."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=False, slack_summary_on_empty=False)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", person="Alice", recorded_at=cursor + 10.0)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    assert len(http.calls) == 0
+
+
+def test_known_person_names_are_slack_escaped(state_db, settings_factory, http):
+    """Special characters in person names (<, >, &) must be escaped for Slack."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=True)
+    now, cursor = anchor(settings)
+    rec.set_meta(state_db, rec.SLACK_SENT_AT_KEY, str(cursor))
+    seed_event(state_db, "e1", person="Alice <Sister & Friend>", recorded_at=cursor + 10.0)
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    rec.maybe_send_slack_summary(state_db, settings, now=now)
+    assert "Alice &lt;Sister &amp; Friend&gt; (1)" in posted_text(http)

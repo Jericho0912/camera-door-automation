@@ -55,6 +55,7 @@ class Settings:
     slack_summary_hour: int
     slack_summary_minute: int
     slack_summary_on_empty: bool
+    slack_include_known: bool
 
     @staticmethod
     def from_env() -> "Settings":
@@ -121,6 +122,7 @@ class Settings:
             slack_summary_hour=slack_hour,
             slack_summary_minute=slack_minute,
             slack_summary_on_empty=b("SLACK_SUMMARY_ON_EMPTY", False),
+            slack_include_known=b("SLACK_INCLUDE_KNOWN", False),
         )
 
 
@@ -840,26 +842,41 @@ def unknown_events_between(state: sqlite3.Connection, since: float, until: float
          ORDER BY e.start_time ASC""", (since, until)).fetchall()
 
 
-def render_slack_summary(rows: list[sqlite3.Row], now: float) -> str:
+def known_events_between(state: sqlite3.Connection, since: float, until: float) -> list[sqlite3.Row]:
+    """Recognized visitors in the window: one row per distinct person."""
+    return state.execute("""
+        SELECT e.person, COUNT(*) AS visit_count
+          FROM event_delivery e
+         WHERE e.recorded_at > ? AND e.recorded_at <= ? AND e.person IS NOT NULL
+         GROUP BY e.person
+         ORDER BY e.person ASC""", (since, until)).fetchall()
+
+
+def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None) -> str:
     day = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%a %d %b")
     if not rows:
-        return f"Door summary {day}: no unknown visitors."
-    lines = [f"Door summary {day}: {len(rows)} unknown visitor event(s)"]
-    for row in rows[:SLACK_SUMMARY_MAX_LINES]:
-        start = datetime.fromtimestamp(float(row["start_time"]), timezone.utc).astimezone()
-        end = datetime.fromtimestamp(float(row["end_time"]), timezone.utc).astimezone()
-        # The window opens at the previous summary, so it can span days — each line
-        # carries its own weekday rather than inheriting the header's.
-        parts = [f"• {start.strftime('%a %H:%M')}–{end.strftime('%H:%M')}",
-                 f"{float(row['end_time']) - float(row['start_time']):.0f}s",
-                 slack_escape(str(row["camera"]))]
-        if row["completed_at"] is None:
-            parts.append("footage not yet uploaded")
-        if row["page_id"]:
-            parts.append(f"<{notion_page_url(str(row['page_id']))}|Notion>")
-        lines.append(" · ".join(parts))
-    if len(rows) > SLACK_SUMMARY_MAX_LINES:
-        lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
+        lines = [f"Door summary {day}: no unknown visitors."]
+    else:
+        lines = [f"Door summary {day}: {len(rows)} unknown visitor event(s)"]
+        for row in rows[:SLACK_SUMMARY_MAX_LINES]:
+            start = datetime.fromtimestamp(float(row["start_time"]), timezone.utc).astimezone()
+            end = datetime.fromtimestamp(float(row["end_time"]), timezone.utc).astimezone()
+            # The window opens at the previous summary, so it can span days — each line
+            # carries its own weekday rather than inheriting the header's.
+            parts = [f"• {start.strftime('%a %H:%M')}–{end.strftime('%H:%M')}",
+                     f"{float(row['end_time']) - float(row['start_time']):.0f}s",
+                     slack_escape(str(row["camera"]))]
+            if row["completed_at"] is None:
+                parts.append("footage not yet uploaded")
+            if row["page_id"]:
+                parts.append(f"<{notion_page_url(str(row['page_id']))}|Notion>")
+            lines.append(" · ".join(parts))
+        if len(rows) > SLACK_SUMMARY_MAX_LINES:
+            lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
+    if known_rows:
+        lines.append("")
+        names = [f"{slack_escape(str(r['person']))} ({r['visit_count']})" for r in known_rows]
+        lines.append(f"Known visitors: {', '.join(names)}")
     return "\n".join(lines)
 
 
@@ -905,11 +922,12 @@ def maybe_send_slack_summary(state: sqlite3.Connection, settings: Settings, now:
         if now < scheduled or float(last) >= scheduled:
             return
         rows = unknown_events_between(state, float(last), now)
-        if not rows and not settings.slack_summary_on_empty:
+        known = known_events_between(state, float(last), now) if settings.slack_include_known else []
+        if not rows and not known and not settings.slack_summary_on_empty:
             set_meta(state, SLACK_SENT_AT_KEY, str(now))
-            LOG.info("Slack summary: no unknown events since the last one; nothing posted")
+            LOG.info("Slack summary: no events since the last one; nothing posted")
             return
-        if post_slack(settings, render_slack_summary(rows, now)):
+        if post_slack(settings, render_slack_summary(rows, now, known_rows=known or None)):
             set_meta(state, SLACK_SENT_AT_KEY, str(now))
             LOG.info("Slack summary posted: %d unknown event(s)", len(rows))
     except Exception:
@@ -929,7 +947,8 @@ def slack_summary_now(settings: Settings) -> int:
         last = get_meta(state, SLACK_SENT_AT_KEY)
         since = float(last) if last is not None else now - 86_400.0
         rows = unknown_events_between(state, since, now)
-        text = render_slack_summary(rows, now)
+        known = known_events_between(state, since, now) if settings.slack_include_known else []
+        text = render_slack_summary(rows, now, known_rows=known or None)
         if settings.dry_run:
             print("DRY RUN — nothing posted. The message would be:\n" + text)
             return 0
@@ -939,7 +958,7 @@ def slack_summary_now(settings: Settings) -> int:
         if not post_slack(settings, text):
             return 1
         set_meta(state, SLACK_SENT_AT_KEY, str(now))
-        print(f"Posted {len(rows)} unknown event(s) covering {utc_iso(since)} to {utc_iso(now)}")
+        print(f"Posted {len(rows)} unknown event(s), {len(known)} known visitor(s) covering {utc_iso(since)} to {utc_iso(now)}")
         return 0
     finally:
         state.close()

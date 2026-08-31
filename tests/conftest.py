@@ -178,6 +178,7 @@ def settings_factory(tmp_path: Path, recordings_dir: Path):
             slack_summary_hour=21,
             slack_summary_minute=0,
             slack_summary_on_empty=False,
+            slack_include_known=False,
         )
         base.update(over)
         return rec.Settings(**base)
@@ -247,7 +248,7 @@ def _s3_client(_moto):
         clip_links=False, clip_url_ttl=604800, clip_refresh_seconds=432000,
         clip_aws_access_key_id=None, clip_aws_secret_access_key=None,
         slack_webhook_url=None, slack_summary_hour=21, slack_summary_minute=0,
-        slack_summary_on_empty=False))
+        slack_summary_on_empty=False, slack_include_known=False))
 
 
 @pytest.fixture
