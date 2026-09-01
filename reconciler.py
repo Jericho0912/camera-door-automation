@@ -939,6 +939,46 @@ def refresh_people_from_source(state: sqlite3.Connection, settings: Settings, si
         if tmp is not None:
             tmp.unlink(missing_ok=True)
 
+def known_people_from_source(settings: Settings, since: float, until: float) -> list[dict[str, Any]]:
+    """Recognized visitor counts from the source Fregata DB for a local-day report."""
+    tmp: Path | None = None
+    fconn: sqlite3.Connection | None = None
+    try:
+        tmp = snapshot_db(settings.source_db)
+        fconn = sqlite3.connect(tmp)
+        fconn.row_factory = sqlite3.Row
+        table, cols = resolve_table(fconn, ("event", "events"), EVENT_REQUIRED)
+        if "sub_label" not in cols:
+            return []
+        where = ["start_time >= ?", "start_time <= ?", "end_time IS NOT NULL", "label = ?"]
+        params: list[Any] = [since, until, settings.label]
+        if settings.camera:
+            where.append("camera = ?")
+            params.append(settings.camera)
+        stats: dict[str, dict[str, Any]] = {}
+        for row in fconn.execute(
+                f"SELECT sub_label, start_time FROM {qident(table)} WHERE {' AND '.join(where)}",
+                params):
+            person = recognized_person({"sub_label": parse_json(row["sub_label"])})
+            if not person:
+                continue
+            started = float(row["start_time"])
+            item = stats.setdefault(person, {
+                "person": person,
+                "visit_count": 0,
+                "first_seen": started,
+                "last_seen": started,
+            })
+            item["visit_count"] += 1
+            item["first_seen"] = min(float(item["first_seen"]), started)
+            item["last_seen"] = max(float(item["last_seen"]), started)
+        return sorted(stats.values(), key=lambda item: str(item["person"]).casefold())
+    finally:
+        if fconn is not None:
+            fconn.close()
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
 
 
 def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None,
@@ -1011,6 +1051,59 @@ def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[s
         "elements": [{"type": "mrkdwn", "text": "🤖 Reconciler NVR Automation · Recorded by Frigate"}],
     })
 
+    return {"text": fallback_text, "blocks": blocks}
+
+def render_slack_people_summary(rows: list[Any], header_ts: float) -> dict[str, Any]:
+    day = datetime.fromtimestamp(header_ts, timezone.utc).astimezone().strftime("%a %d %b")
+    total_visits = sum(int(r["visit_count"]) for r in rows)
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"Door Camera People Summary · {day}", "emoji": False},
+        }
+    ]
+
+    if not rows:
+        fallback_text = f"People summary {day}: no recognized people."
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*No recognized people recorded.*"},
+        })
+    else:
+        people_label = "person" if len(rows) == 1 else "people"
+        event_label = "event" if total_visits == 1 else "events"
+        fallback_text = f"People summary {day}: {len(rows)} recognized {people_label}, {total_visits} {event_label}"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                     "text": f"*Recognized People ({len(rows)} {people_label}, {total_visits} {event_label})*\n"
+                             "_Person · Events · First seen · Last seen_"},
+        })
+
+        def local_hms(value: Any) -> str:
+            return datetime.fromtimestamp(float(value), timezone.utc).astimezone().strftime("%H:%M:%S")
+
+        for row in rows[:SLACK_SUMMARY_MAX_LINES]:
+            blocks.append({
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Person*\n{slack_escape(str(row['person']))}"},
+                    {"type": "mrkdwn", "text": f"*Events*\n`{int(row['visit_count'])}`"},
+                    {"type": "mrkdwn", "text": f"*First seen*\n`{local_hms(row['first_seen'])}`"},
+                    {"type": "mrkdwn", "text": f"*Last seen*\n`{local_hms(row['last_seen'])}`"},
+                ],
+            })
+        if len(rows) > SLACK_SUMMARY_MAX_LINES:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more recognized people."},
+            })
+
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "Reconciler NVR Automation · Recorded by Frigate"}],
+    })
     return {"text": fallback_text, "blocks": blocks}
 
 
@@ -1137,6 +1230,34 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
         return 0
     finally:
         state.close()
+
+def slack_people_summary_now(settings: Settings, target_date: str | None = None) -> int:
+    """Post a recognized-people Slack summary for a local calendar day."""
+    if target_date is None:
+        target_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+    try:
+        since, until, header_ts = parse_date_window(target_date)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    try:
+        rows = known_people_from_source(settings, since, until)
+    except Exception as exc:
+        print(f"Could not read Fregata source DB: {exc}")
+        return 1
+    total_visits = sum(int(r["visit_count"]) for r in rows)
+    payload = render_slack_people_summary(rows, header_ts)
+    if settings.dry_run:
+        print("DRY RUN — nothing posted. The message would be:\n" + json.dumps(payload, indent=2))
+        return 0
+    if not settings.slack_webhook_url:
+        print("SLACK_WEBHOOK_URL is not set")
+        return 1
+    if not post_slack(settings, payload):
+        return 1
+    print(f"Posted people summary for {len(rows)} recognized person(s), {total_visits} event(s) covering {utc_iso(since)} to {utc_iso(until)}")
+    return 0
 
 
 def process_event(event: dict[str, Any], fconn: sqlite3.Connection, recording_table: str, recording_cols: set[str], state: sqlite3.Connection, client, settings: Settings) -> None:
@@ -1320,9 +1441,9 @@ def clips_reset(settings: Settings) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reconcile Fregata events and recording segments to S3")
-    parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset", "slack-summary"))
-    parser.add_argument("date", nargs="?", help="Optional date for slack-summary (YYYY-MM-DD, e.g. 2026-08-19)")
-    parser.add_argument("--date", dest="opt_date", help="Optional date for slack-summary (YYYY-MM-DD)")
+    parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset", "slack-summary", "slack-people-summary"))
+    parser.add_argument("date", nargs="?", help="Optional date for Slack summary commands (YYYY-MM-DD, e.g. 2026-08-19)")
+    parser.add_argument("--date", dest="opt_date", help="Optional date for Slack summary commands (YYYY-MM-DD)")
     args = parser.parse_args()
     settings = Settings.from_env()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
@@ -1332,6 +1453,9 @@ def main() -> int:
     if args.command == "slack-summary":
         target = args.date or args.opt_date
         return slack_summary_now(settings, target_date=target)
+    if args.command == "slack-people-summary":
+        target = args.date or args.opt_date
+        return slack_people_summary_now(settings, target_date=target)
     if args.command == "once": return run_once(settings)
     while True:
         try:

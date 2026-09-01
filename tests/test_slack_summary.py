@@ -459,6 +459,41 @@ def test_specific_date_refreshes_person_from_source_before_unknown_filter(settin
     finally:
         state.close()
 
+def test_slack_people_summary_posts_known_people_for_specific_date(settings_factory, http):
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
+    start_19, _, _ = rec.parse_date_window("2026-08-19")
+    start_20, _, _ = rec.parse_date_window("2026-08-20")
+    build_source_db(settings.source_db, events=[
+        make_event(id="alice-1", start_time=start_19 + 60.0, end_time=start_19 + 80.0,
+                   sub_label="Alice"),
+        make_event(id="alice-2", start_time=start_19 + 120.0, end_time=start_19 + 150.0,
+                   sub_label="Alice"),
+        make_event(id="bob-1", start_time=start_19 + 180.0, end_time=start_19 + 210.0,
+                   sub_label="Bob"),
+        make_event(id="unknown-1", start_time=start_19 + 240.0, end_time=start_19 + 260.0,
+                   sub_label=None),
+        make_event(id="next-day", start_time=start_20 + 60.0, end_time=start_20 + 90.0,
+                   sub_label="Carol"),
+    ])
+
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    assert rec.slack_people_summary_now(settings, target_date="2026-08-19") == 0
+
+    text = posted_text(http)
+    assert "Door Camera People Summary" in text
+    assert "Recognized People (2 people, 3 events)" in text
+    assert "Alice" in text
+    assert "Bob" in text
+    assert "Carol" not in text
+    assert "Unknown Visitors" not in text
+
+
+def test_slack_people_summary_invalid_date_format_fails(settings_factory, capsys):
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
+    assert rec.slack_people_summary_now(settings, target_date="not-a-valid-date") == 1
+    assert "Invalid date format" in capsys.readouterr().out
+
+
 def test_slack_summary_invalid_date_format_fails(settings_factory, capsys):
     settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
     assert rec.slack_summary_now(settings, target_date="not-a-valid-date") == 1

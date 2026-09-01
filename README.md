@@ -151,6 +151,16 @@ python3 reconciler.py slack-summary 2026-08-19
 python3 reconciler.py slack-summary --date 2026-08-19
 ```
 
+The scheduled message is unknown-only unless `SLACK_INCLUDE_KNOWN=true`. To send
+a separate familiar-people summary for a local calendar day, without changing
+the scheduled cursor:
+
+```bash
+python3 reconciler.py slack-people-summary 2026-08-19
+# or omit the date for today's local calendar day:
+python3 reconciler.py slack-people-summary
+```
+
 ## Dependency register
 
 Everything the service needs, declared. Nothing here should live only in someone's shell history.
