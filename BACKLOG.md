@@ -53,3 +53,28 @@ directly in Slack would allow immediate recognition without clicking into Notion
   default) must be preserved.
 
 **Recorded:** 2026-09-01.
+
+---
+
+## 3. Mac mini and Frigate downtime / outage monitoring in Slack
+
+**Problem.** If the Mac mini loses power, sleeps unexpectedly, or Frigate NVR
+crashes / goes offline, camera logging stops silently during the outage. While
+the reconciler catches up on missed events once restored, there is no visibility
+into how long the system was down or whether coverage was interrupted.
+
+**Proposed behavior:**
+
+- **Mac mini sleep / offline tracking:** The watch loop runs on `POLL_SECONDS`
+  (default 30 s). If the elapsed real time between two consecutive poll cycles
+  exceeds a threshold (e.g. `> 2 * POLL_SECONDS + 30s` or after system reboot),
+  the reconciler records an outage interval (`outage_start` to `outage_end`) in
+  the state database.
+- **Frigate DB accessibility tracking:** Track failed attempts to connect to or
+  snapshot `FREGATA_DB_PATH` to measure Frigate unavailability separately from
+  Mac downtime.
+- **Slack delivery:** Alongside or right after the scheduled daily summary (or on
+  recovery if downtime exceeded an alert threshold), send a dedicated notice:
+  `⚠️ System Outage Notice: Mac mini was offline/sleeping for 2h 15m (13:30–15:45)`.
+
+**Recorded:** 2026-09-01.
