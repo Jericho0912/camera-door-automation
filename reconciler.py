@@ -832,22 +832,24 @@ def notion_page_url(page_id: str) -> str:
     return "https://www.notion.so/" + page_id.replace("-", "")
 
 
-def unknown_events_between(state: sqlite3.Connection, since: float, until: float) -> list[sqlite3.Row]:
-    # person IS NULL is only meaningful on rows this build recorded; rows from older
-    # builds have recorded_at NULL too and fall outside every window by construction.
-    return state.execute("""
+def unknown_events_between(state: sqlite3.Connection, since: float, until: float, by_field: str = "recorded_at") -> list[sqlite3.Row]:
+    # When querying historical dates, filter by start_time (when the event happened).
+    # In the automated loop, filter by recorded_at (when the event entered the state DB).
+    time_col = "start_time" if by_field == "start_time" else "recorded_at"
+    return state.execute(f"""
         SELECT e.event_id, e.camera, e.start_time, e.end_time, e.completed_at, n.page_id
           FROM event_delivery e LEFT JOIN notion_delivery n ON n.event_id = e.event_id
-         WHERE e.recorded_at > ? AND e.recorded_at <= ? AND e.person IS NULL
+         WHERE e.{time_col} >= ? AND e.{time_col} <= ? AND e.person IS NULL
          ORDER BY e.start_time ASC""", (since, until)).fetchall()
 
 
-def known_events_between(state: sqlite3.Connection, since: float, until: float) -> list[sqlite3.Row]:
+def known_events_between(state: sqlite3.Connection, since: float, until: float, by_field: str = "recorded_at") -> list[sqlite3.Row]:
     """Recognized visitors in the window: one row per distinct person."""
-    return state.execute("""
+    time_col = "start_time" if by_field == "start_time" else "recorded_at"
+    return state.execute(f"""
         SELECT e.person, COUNT(*) AS visit_count
           FROM event_delivery e
-         WHERE e.recorded_at > ? AND e.recorded_at <= ? AND e.person IS NOT NULL
+         WHERE e.{time_col} >= ? AND e.{time_col} <= ? AND e.person IS NOT NULL
          GROUP BY e.person
          ORDER BY e.person ASC""", (since, until)).fetchall()
 
@@ -998,16 +1000,18 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
             except ValueError as exc:
                 print(f"Error: {exc}")
                 return 1
+            by_field = "start_time"
             is_historical = True
         else:
             last = get_meta(state, SLACK_SENT_AT_KEY)
             since = float(last) if last is not None else now - 86_400.0
             until = now
             header_ts = now
+            by_field = "recorded_at" if last is not None else "start_time"
             is_historical = False
 
-        rows = unknown_events_between(state, since, until)
-        known = known_events_between(state, since, until) if settings.slack_include_known else []
+        rows = unknown_events_between(state, since, until, by_field=by_field)
+        known = known_events_between(state, since, until, by_field=by_field) if settings.slack_include_known else []
         text = render_slack_summary(rows, header_ts, known_rows=known or None)
         if settings.dry_run:
             print("DRY RUN — nothing posted. The message would be:\n" + json.dumps(text, indent=2))
