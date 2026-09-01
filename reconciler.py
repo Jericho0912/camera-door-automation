@@ -852,17 +852,31 @@ def known_events_between(state: sqlite3.Connection, since: float, until: float) 
          ORDER BY e.person ASC""", (since, until)).fetchall()
 
 
-def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None) -> str:
+def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None) -> dict[str, Any]:
     day = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%a %d %b")
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"🚪 Door Camera Daily Summary · {day}", "emoji": True},
+        }
+    ]
+
     if not rows:
-        lines = [f"Door summary {day}: no unknown visitors."]
+        fallback_text = f"Door summary {day}: no unknown visitors."
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "✅ *No unknown visitors.*"},
+        })
     else:
-        lines = [f"Door summary {day}: {len(rows)} unknown visitor event(s)"]
+        fallback_text = f"Door summary {day}: {len(rows)} unknown visitor event(s)"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*⚠️ Unknown Visitors ({len(rows)} event{'s' if len(rows) != 1 else ''})*"},
+        })
+        event_lines = []
         for row in rows[:SLACK_SUMMARY_MAX_LINES]:
             start = datetime.fromtimestamp(float(row["start_time"]), timezone.utc).astimezone()
             end = datetime.fromtimestamp(float(row["end_time"]), timezone.utc).astimezone()
-            # The window opens at the previous summary, so it can span days — each line
-            # carries its own weekday rather than inheriting the header's.
             parts = [f"• {start.strftime('%a %H:%M')}–{end.strftime('%H:%M')}",
                      f"{float(row['end_time']) - float(row['start_time']):.0f}s",
                      slack_escape(str(row["camera"]))]
@@ -870,19 +884,35 @@ def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[s
                 parts.append("footage not yet uploaded")
             if row["page_id"]:
                 parts.append(f"<{notion_page_url(str(row['page_id']))}|Notion>")
-            lines.append(" · ".join(parts))
+            event_lines.append(" · ".join(parts))
         if len(rows) > SLACK_SUMMARY_MAX_LINES:
-            lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
+            event_lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(event_lines)},
+        })
+
     if known_rows:
-        lines.append("")
+        blocks.append({"type": "divider"})
         names = [f"{slack_escape(str(r['person']))} ({r['visit_count']})" for r in known_rows]
-        lines.append(f"Known visitors: {', '.join(names)}")
-    return "\n".join(lines)
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"👤 *Familiar People (HH)*\nKnown visitors: {', '.join(names)}"},
+        })
+        fallback_text += f", {len(known_rows)} known visitor(s)"
+
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "🤖 Reconciler NVR Automation · Recorded by Frigate"}],
+    })
+
+    return {"text": fallback_text, "blocks": blocks}
 
 
-def post_slack(settings: Settings, text: str) -> bool:
+def post_slack(settings: Settings, payload: str | dict[str, Any]) -> bool:
+    body = {"text": payload} if isinstance(payload, str) else payload
     try:
-        resp = requests.post(settings.slack_webhook_url, json={"text": text}, timeout=15)
+        resp = requests.post(settings.slack_webhook_url, json=body, timeout=15)
     except Exception as exc:
         LOG.warning("Slack webhook unreachable: %s", exc)
         return False
@@ -950,7 +980,7 @@ def slack_summary_now(settings: Settings) -> int:
         known = known_events_between(state, since, now) if settings.slack_include_known else []
         text = render_slack_summary(rows, now, known_rows=known or None)
         if settings.dry_run:
-            print("DRY RUN — nothing posted. The message would be:\n" + text)
+            print("DRY RUN — nothing posted. The message would be:\n" + json.dumps(text, indent=2))
             return 0
         if not settings.slack_webhook_url:
             print("SLACK_WEBHOOK_URL is not set")

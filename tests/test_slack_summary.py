@@ -40,7 +40,8 @@ def seed_event(state, event_id, *, person=None, recorded_at=NOW, camera="door_ca
 
 def posted_text(http) -> str:
     assert len(http.calls) == 1, "expected exactly one Slack post"
-    return json.loads(http.calls[0].request.body)["text"]
+    body = json.loads(http.calls[0].request.body)
+    return json.dumps(body)
 
 
 def anchor(settings):
