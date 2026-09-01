@@ -966,19 +966,49 @@ def maybe_send_slack_summary(state: sqlite3.Connection, settings: Settings, now:
         LOG.exception("Slack summary pass failed")
 
 
-def slack_summary_now(settings: Settings) -> int:
+def parse_date_window(date_str: str) -> tuple[float, float, float]:
+    """Parse a date string (YYYY-MM-DD) in local timezone to (start_epoch, end_epoch, mid_epoch)."""
+    cleaned = date_str.strip().replace("/", "-")
+    try:
+        parts = [int(p) for p in cleaned.split("-")]
+        if len(parts) != 3:
+            raise ValueError
+        year, month, day = parts
+        local_tz = datetime.now().astimezone().tzinfo
+        start_dt = datetime(year, month, day, 0, 0, 0, tzinfo=local_tz)
+        end_dt = datetime(year, month, day, 23, 59, 59, 999999, tzinfo=local_tz)
+        return start_dt.timestamp(), end_dt.timestamp(), (start_dt.timestamp() + end_dt.timestamp()) / 2.0
+    except Exception:
+        raise ValueError(f"Invalid date format {date_str!r}. Expected YYYY-MM-DD (e.g. 2026-08-19)") from None
+
+
+def slack_summary_now(settings: Settings, target_date: str | None = None) -> int:
     """Post the summary immediately, ignoring the schedule — the manual test gesture.
 
-    With no cursor yet (Slack never configured before), covers the last 24 hours.
+    With a target_date (YYYY-MM-DD), covers exactly that local calendar day without
+    advancing the automated schedule cursor.
+    With no target_date and no cursor yet, covers the last 24 hours.
     """
     state = open_state(settings.state_db)
     try:
         now = time.time()
-        last = get_meta(state, SLACK_SENT_AT_KEY)
-        since = float(last) if last is not None else now - 86_400.0
-        rows = unknown_events_between(state, since, now)
-        known = known_events_between(state, since, now) if settings.slack_include_known else []
-        text = render_slack_summary(rows, now, known_rows=known or None)
+        if target_date:
+            try:
+                since, until, header_ts = parse_date_window(target_date)
+            except ValueError as exc:
+                print(f"Error: {exc}")
+                return 1
+            is_historical = True
+        else:
+            last = get_meta(state, SLACK_SENT_AT_KEY)
+            since = float(last) if last is not None else now - 86_400.0
+            until = now
+            header_ts = now
+            is_historical = False
+
+        rows = unknown_events_between(state, since, until)
+        known = known_events_between(state, since, until) if settings.slack_include_known else []
+        text = render_slack_summary(rows, header_ts, known_rows=known or None)
         if settings.dry_run:
             print("DRY RUN — nothing posted. The message would be:\n" + json.dumps(text, indent=2))
             return 0
@@ -987,8 +1017,9 @@ def slack_summary_now(settings: Settings) -> int:
             return 1
         if not post_slack(settings, text):
             return 1
-        set_meta(state, SLACK_SENT_AT_KEY, str(now))
-        print(f"Posted {len(rows)} unknown event(s), {len(known)} known visitor(s) covering {utc_iso(since)} to {utc_iso(now)}")
+        if not is_historical:
+            set_meta(state, SLACK_SENT_AT_KEY, str(now))
+        print(f"Posted {len(rows)} unknown event(s), {len(known)} known visitor(s) covering {utc_iso(since)} to {utc_iso(until)}")
         return 0
     finally:
         state.close()
@@ -1176,13 +1207,17 @@ def clips_reset(settings: Settings) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reconcile Fregata events and recording segments to S3")
     parser.add_argument("command", choices=("inspect", "once", "watch", "status", "clips-reset", "slack-summary"))
+    parser.add_argument("date", nargs="?", help="Optional date for slack-summary (YYYY-MM-DD, e.g. 2026-08-19)")
+    parser.add_argument("--date", dest="opt_date", help="Optional date for slack-summary (YYYY-MM-DD)")
     args = parser.parse_args()
     settings = Settings.from_env()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "inspect": return inspect(settings)
     if args.command == "status": return status(settings)
     if args.command == "clips-reset": return clips_reset(settings)
-    if args.command == "slack-summary": return slack_summary_now(settings)
+    if args.command == "slack-summary":
+        target = args.date or args.opt_date
+        return slack_summary_now(settings, target_date=target)
     if args.command == "once": return run_once(settings)
     while True:
         try:

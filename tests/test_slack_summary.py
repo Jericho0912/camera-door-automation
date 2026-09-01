@@ -346,3 +346,44 @@ def test_known_person_names_are_slack_escaped(state_db, settings_factory, http):
     http.add(responses.POST, WEBHOOK, body="ok", status=200)
     rec.maybe_send_slack_summary(state_db, settings, now=now)
     assert "Alice &lt;Sister &amp; Friend&gt; (1)" in posted_text(http)
+
+
+
+# --------------------------------------------------------------------------
+# Specific date selection (target_date)
+# --------------------------------------------------------------------------
+
+def test_slack_summary_for_specific_date(settings_factory, http):
+    """Specifying a historical date selects events only from that calendar day and leaves cursor untouched."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=True)
+    state = rec.open_state(settings.state_db)
+    
+    # 2026-08-19 in local time
+    start_19, end_19, _ = rec.parse_date_window("2026-08-19")
+    seed_event(state, "e_aug19", person="Alice", recorded_at=start_19 + 3600.0)
+    
+    # Another day (2026-08-20)
+    start_20, _, _ = rec.parse_date_window("2026-08-20")
+    seed_event(state, "e_aug20", person="Bob", recorded_at=start_20 + 3600.0)
+    state.close()
+
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    assert rec.slack_summary_now(settings, target_date="2026-08-19") == 0
+    
+    text = posted_text(http)
+    assert "Alice" in text
+    assert "Bob" not in text
+    assert "19 Aug" in text
+
+    # Cursor in state DB must NOT have been updated by historical query
+    state = rec.open_state(settings.state_db)
+    try:
+        assert rec.get_meta(state, rec.SLACK_SENT_AT_KEY) is None
+    finally:
+        state.close()
+
+
+def test_slack_summary_invalid_date_format_fails(settings_factory, capsys):
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
+    assert rec.slack_summary_now(settings, target_date="not-a-valid-date") == 1
+    assert "Invalid date format" in capsys.readouterr().out

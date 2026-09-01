@@ -139,6 +139,14 @@ Design choices worth knowing:
 Test the pipe end-to-end with `python3 reconciler.py slack-summary`, which posts
 immediately (covering the last 24 h if no summary was ever sent).
 
+To send a summary for a **specific historical date** (without modifying the automated schedule cursor):
+
+```bash
+python3 reconciler.py slack-summary 2026-08-19
+# or with flag:
+python3 reconciler.py slack-summary --date 2026-08-19
+```
+
 ## Dependency register
 
 Everything the service needs, declared. Nothing here should live only in someone's shell history.
