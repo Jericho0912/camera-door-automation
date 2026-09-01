@@ -1,4 +1,4 @@
-"""The four commands, their exit codes, and their resource hygiene."""
+"""The commands, their exit codes, and their resource hygiene."""
 from __future__ import annotations
 
 import json
@@ -361,6 +361,13 @@ def test_each_command_dispatches(monkeypatch, cli, command, target):
     assert cli([command]) == 7
     assert called == [target]
 
+
+def test_slack_people_summary_command_dispatches_with_date(monkeypatch, cli):
+    called = []
+    monkeypatch.setattr(rec, "slack_people_summary_now",
+                        lambda s, target_date=None: called.append(target_date) or 7)
+    assert cli(["slack-people-summary", "2026-08-19"]) == 7
+    assert called == ["2026-08-19"]
 
 def test_an_unknown_command_is_rejected(cli):
     with pytest.raises(SystemExit) as exc:

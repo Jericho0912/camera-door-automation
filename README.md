@@ -116,12 +116,19 @@ door camera should not own your notifications — and quiet days post nothing un
 `SLACK_SUMMARY_ON_EMPTY=true`.
 
 Design choices worth knowing:
-
-- **Names never reach Slack.** The summary is exactly the events *without* a
-  recognized person, so `NOTION_INCLUDE_PERSON` is irrelevant to it.
-- **No presigned clip URLs in Slack.** Those are bearer tokens and Slack retains
-  messages indefinitely; each line links to the event's Notion page instead, which
-  is access-controlled and where the clip already lives.
+- **Slack Block Kit Cards.** Summaries are formatted as Slack Block Kit cards
+  with table-like event rows: snapshot thumbnail when enabled, time, duration,
+  camera/status, and a direct Notion page link.
+- **Snapshots are opt-in.** Set `SLACK_INCLUDE_SNAPSHOTS=true` to upload event
+  snapshots from Frigate's `media/clips` directory to S3 and include presigned
+  image URLs in Slack. Leave it off if you do not want face images retained by
+  Slack.
+- **Recognized visitors opt-in.** Familiar (household) people can be included
+  in the summary by setting `SLACK_INCLUDE_KNOWN=true`. Recognized names and
+  visit counts are listed cleanly without attaching video links.
+- **No presigned clip URLs in Slack.** Video links remain out of Slack; each
+  event card links to its Notion page instead, which is access-controlled and
+  where the clip already lives.
 - **Windows are gap-free, not calendar days.** Each summary covers everything
   recorded since the previous one, so an event at 23:50 lands in the next evening's
   message rather than vanishing. If the Mac is asleep at summary time, the first
@@ -135,6 +142,24 @@ Design choices worth knowing:
 
 Test the pipe end-to-end with `python3 reconciler.py slack-summary`, which posts
 immediately (covering the last 24 h if no summary was ever sent).
+
+To send a summary for a **specific historical date** (without modifying the automated schedule cursor):
+
+```bash
+python3 reconciler.py slack-summary 2026-08-19
+# or with flag:
+python3 reconciler.py slack-summary --date 2026-08-19
+```
+
+The scheduled message is unknown-only unless `SLACK_INCLUDE_KNOWN=true`. To send
+a separate familiar-people summary for a local calendar day, without changing
+the scheduled cursor, use the plain numbered-name list:
+
+```bash
+python3 reconciler.py slack-people-summary 2026-08-19
+# or omit the date for today's local calendar day:
+python3 reconciler.py slack-people-summary
+```
 
 ## Dependency register
 
