@@ -1,5 +1,5 @@
 """The Slack end-of-day summary: window arithmetic, once-per-day gating, and
-what may never appear in the message (names, presigned URLs).
+what may never appear by default (names, presigned URLs).
 
 The cursor in ``meta`` is both the dedupe marker and the left edge of the next
 window, so most tests pivot on where events' ``recorded_at`` falls relative to it.
@@ -212,6 +212,42 @@ def test_message_lines_and_notion_link(state_db, slack_settings, http):
     assert "footage not yet uploaded" in text
     assert "AWSAccessKeyId" not in text and "X-Amz-" not in text
 
+
+
+def test_snapshot_url_renders_as_event_accessory(state_db, slack_settings):
+    seed_event(state_db, "e1", recorded_at=NOW - 10.0, start=NOW, end=NOW + 42.0)
+    state_db.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                        VALUES('e1','abc-123-def',?,?)""", (NOW, NOW))
+    state_db.commit()
+    rows = rec.unknown_events_between(state_db, NOW - 20.0, NOW)
+
+    payload = rec.render_slack_summary(
+        rows, NOW, snapshot_urls={"e1": "https://example.test/snapshot.jpg"})
+
+    body = json.dumps(payload)
+    event_block = next(b for b in payload["blocks"] if b.get("accessory"))
+    assert event_block["accessory"]["image_url"] == "https://example.test/snapshot.jpg"
+    assert "<https://www.notion.so/abc123def|Notion>" in body
+    assert "42s" in body
+
+
+def test_snapshot_uploads_and_presigns_when_enabled(settings_factory, s3):
+    settings = settings_factory(dry_run=False, slack_include_snapshots=True)
+    clips_dir = settings.recordings_dir.parent / "clips"
+    clips_dir.mkdir()
+    (clips_dir / "door_camera-e1.jpg").write_bytes(b"\xff\xd8fake-jpeg\xff\xd9")
+    state = rec.open_state(settings.state_db)
+    try:
+        seed_event(state, "e1", recorded_at=NOW)
+        rows = rec.unknown_events_between(state, NOW - 1.0, NOW + 1.0)
+        urls = rec.slack_snapshot_urls(rows, settings, client=s3, signer=s3)
+    finally:
+        state.close()
+
+    assert list(urls) == ["e1"]
+    assert "X-Amz-Signature" in urls["e1"]
+    objects = s3.list_objects_v2(Bucket=settings.bucket, Prefix="fregata/slack-snapshots/door_camera/e1.jpg")
+    assert objects["KeyCount"] == 1
 
 def test_camera_names_are_slack_escaped(state_db, slack_settings, http):
     now, cursor = anchor(slack_settings)

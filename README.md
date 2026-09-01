@@ -117,14 +117,18 @@ door camera should not own your notifications — and quiet days post nothing un
 
 Design choices worth knowing:
 - **Slack Block Kit Cards.** Summaries are formatted as Slack Block Kit cards
-  with color-coded sidebar indicators (crimson/amber for activity, green for
-  quiet days), two-column metadata fields, and action buttons.
+  with table-like event rows: snapshot thumbnail when enabled, time, duration,
+  camera/status, and a direct Notion page link.
+- **Snapshots are opt-in.** Set `SLACK_INCLUDE_SNAPSHOTS=true` to upload event
+  snapshots from Frigate's `media/clips` directory to S3 and include presigned
+  image URLs in Slack. Leave it off if you do not want face images retained by
+  Slack.
 - **Recognized visitors opt-in.** Familiar (household) people can be included
   in the summary by setting `SLACK_INCLUDE_KNOWN=true`. Recognized names and
   visit counts are listed cleanly without attaching video links.
-- **No presigned clip URLs in Slack.** Those are bearer tokens and Slack retains
-  messages indefinitely; each event card links to its Notion page instead, which
-  is access-controlled and where the clip already lives.
+- **No presigned clip URLs in Slack.** Video links remain out of Slack; each
+  event card links to its Notion page instead, which is access-controlled and
+  where the clip already lives.
 - **Windows are gap-free, not calendar days.** Each summary covers everything
   recorded since the previous one, so an event at 23:50 lands in the next evening's
   message rather than vanishing. If the Mac is asleep at summary time, the first

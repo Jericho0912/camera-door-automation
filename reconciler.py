@@ -56,6 +56,7 @@ class Settings:
     slack_summary_minute: int
     slack_summary_on_empty: bool
     slack_include_known: bool
+    slack_include_snapshots: bool
 
     @staticmethod
     def from_env() -> "Settings":
@@ -123,6 +124,7 @@ class Settings:
             slack_summary_minute=slack_minute,
             slack_summary_on_empty=b("SLACK_SUMMARY_ON_EMPTY", False),
             slack_include_known=b("SLACK_INCLUDE_KNOWN", False),
+            slack_include_snapshots=b("SLACK_INCLUDE_SNAPSHOTS", False),
         )
 
 
@@ -811,15 +813,14 @@ def sync_notion(event: dict[str, Any], manifest_key: str | None, segments: int, 
 #
 # No per-event pings. Once per local day, at SLACK_SUMMARY_TIME, the poll loop
 # posts a single message to an incoming webhook listing every event recorded
-# since the previous summary whose face recognition matched nobody. Names never
-# appear in it — recognized people are exactly what it excludes — and no
-# presigned clip URL is ever posted: those are bearer tokens and Slack retains
-# messages indefinitely. The Notion page link goes instead; it is
-# access-controlled and already the system's viewing surface.
+# since the previous summary whose face recognition matched nobody. Recognized
+# names and event snapshots are opt-in because both are person data. Video clip
+# URLs are never posted: those are bearer tokens and Notion is already the
+# access-controlled viewing surface.
 # --------------------------------------------------------------------------
 
 SLACK_SENT_AT_KEY = "slack_summary_sent_at"
-SLACK_SUMMARY_MAX_LINES = 25
+SLACK_SUMMARY_MAX_LINES = 40
 
 
 def slack_escape(text: str) -> str:
@@ -830,6 +831,50 @@ def slack_escape(text: str) -> str:
 
 def notion_page_url(page_id: str) -> str:
     return "https://www.notion.so/" + page_id.replace("-", "")
+
+def slack_snapshot_path(settings: Settings, camera: str, event_id: str) -> Path | None:
+    clips_dir = settings.recordings_dir.parent / "clips"
+    stem = f"{camera}-{event_id}"
+    for name in (f"{stem}.jpg", f"{stem}-clean.webp", f"{stem}.webp",
+                 f"{stem}-clean.jpg", f"{stem}.png", f"{stem}-clean.png"):
+        path = clips_dir / name
+        if path.is_file():
+            return path
+    return None
+
+
+def slack_snapshot_key(settings: Settings, camera: str, event_id: str, source: Path) -> str:
+    rel = f"slack-snapshots/{camera}/{event_id}{source.suffix.lower()}"
+    return f"{settings.prefix}/{rel}" if settings.prefix else rel
+
+
+def slack_snapshot_urls(rows: list[sqlite3.Row], settings: Settings, client=None, signer=None) -> dict[str, str]:
+    if not settings.slack_include_snapshots:
+        return {}
+    if settings.dry_run:
+        return {}
+    if not settings.bucket:
+        LOG.warning("SLACK_INCLUDE_SNAPSHOTS=true but S3_BUCKET is empty; posting Slack summary without images")
+        return {}
+    warn_if_presign_capped(settings)
+    client = client or s3_client(settings)
+    signer = signer or clip_signer_client(settings) or client
+    urls: dict[str, str] = {}
+    for row in rows[:SLACK_SUMMARY_MAX_LINES]:
+        event_id = str(row["event_id"])
+        camera = str(row["camera"])
+        path = slack_snapshot_path(settings, camera, event_id)
+        if path is None:
+            LOG.info("Slack snapshot not found for event %s", event_id)
+            continue
+        key = slack_snapshot_key(settings, camera, event_id, path)
+        try:
+            upload_file(client, settings, path, key)
+            urls[event_id] = presign_get(signer, settings, key)
+        except Exception as exc:
+            LOG.warning("Slack snapshot unavailable for event %s: %s", event_id, exc)
+    return urls
+
 
 
 def unknown_events_between(state: sqlite3.Connection, since: float, until: float, by_field: str = "recorded_at") -> list[sqlite3.Row]:
@@ -854,8 +899,10 @@ def known_events_between(state: sqlite3.Connection, since: float, until: float, 
          ORDER BY e.person ASC""", (since, until)).fetchall()
 
 
-def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None) -> dict[str, Any]:
+def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None,
+                         snapshot_urls: dict[str, str] | None = None) -> dict[str, Any]:
     day = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%a %d %b")
+    snapshot_urls = snapshot_urls or {}
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
@@ -873,26 +920,40 @@ def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[s
         fallback_text = f"Door summary {day}: {len(rows)} unknown visitor event(s)"
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*⚠️ Unknown Visitors ({len(rows)} event{'s' if len(rows) != 1 else ''})*"},
+            "text": {"type": "mrkdwn",
+                     "text": f"*⚠️ Unknown Visitors ({len(rows)} event{'s' if len(rows) != 1 else ''})*\n"
+                             "_Snapshot · Time · Duration · Camera · Notion_"},
         })
-        event_lines = []
-        for row in rows[:SLACK_SUMMARY_MAX_LINES]:
+        for idx, row in enumerate(rows[:SLACK_SUMMARY_MAX_LINES], start=1):
+            event_id = str(row["event_id"])
             start = datetime.fromtimestamp(float(row["start_time"]), timezone.utc).astimezone()
             end = datetime.fromtimestamp(float(row["end_time"]), timezone.utc).astimezone()
-            parts = [f"• {start.strftime('%a %H:%M')}–{end.strftime('%H:%M')}",
-                     f"{float(row['end_time']) - float(row['start_time']):.0f}s",
-                     slack_escape(str(row["camera"]))]
-            if row["completed_at"] is None:
-                parts.append("footage not yet uploaded")
-            if row["page_id"]:
-                parts.append(f"<{notion_page_url(str(row['page_id']))}|Notion>")
-            event_lines.append(" · ".join(parts))
+            duration = float(row["end_time"]) - float(row["start_time"])
+            status = "footage not yet uploaded" if row["completed_at"] is None else "uploaded"
+            notion = f"<{notion_page_url(str(row['page_id']))}|Notion>" if row["page_id"] else "_not synced yet_"
+            section: dict[str, Any] = {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*#{idx} Time*\n`{start.strftime('%H:%M:%S')}–{end.strftime('%H:%M:%S')}`"},
+                    {"type": "mrkdwn", "text": f"*Duration*\n`{duration:.0f}s`"},
+                    {"type": "mrkdwn", "text": f"*Camera / Status*\n`{slack_escape(str(row['camera']))}` · {status}"},
+                    {"type": "mrkdwn", "text": f"*Notion*\n{notion}"},
+                ],
+            }
+            image_url = snapshot_urls.get(event_id)
+            if image_url:
+                section["accessory"] = {
+                    "type": "image",
+                    "image_url": image_url,
+                    "alt_text": f"Snapshot for event {event_id}",
+                }
+            blocks.append(section)
         if len(rows) > SLACK_SUMMARY_MAX_LINES:
-            event_lines.append(f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion.")
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(event_lines)},
-        })
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"…and {len(rows) - SLACK_SUMMARY_MAX_LINES} more — the full list is in Notion."},
+            })
 
     if known_rows:
         blocks.append({"type": "divider"})
@@ -959,7 +1020,9 @@ def maybe_send_slack_summary(state: sqlite3.Connection, settings: Settings, now:
             set_meta(state, SLACK_SENT_AT_KEY, str(now))
             LOG.info("Slack summary: no events since the last one; nothing posted")
             return
-        if post_slack(settings, render_slack_summary(rows, now, known_rows=known or None)):
+        snapshots = slack_snapshot_urls(rows, settings)
+        payload = render_slack_summary(rows, now, known_rows=known or None, snapshot_urls=snapshots)
+        if post_slack(settings, payload):
             set_meta(state, SLACK_SENT_AT_KEY, str(now))
             LOG.info("Slack summary posted: %d unknown event(s)", len(rows))
     except Exception:
@@ -1012,13 +1075,15 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
 
         rows = unknown_events_between(state, since, until, by_field=by_field)
         known = known_events_between(state, since, until, by_field=by_field) if settings.slack_include_known else []
-        text = render_slack_summary(rows, header_ts, known_rows=known or None)
         if settings.dry_run:
+            text = render_slack_summary(rows, header_ts, known_rows=known or None)
             print("DRY RUN — nothing posted. The message would be:\n" + json.dumps(text, indent=2))
             return 0
         if not settings.slack_webhook_url:
             print("SLACK_WEBHOOK_URL is not set")
             return 1
+        snapshots = slack_snapshot_urls(rows, settings)
+        text = render_slack_summary(rows, header_ts, known_rows=known or None, snapshot_urls=snapshots)
         if not post_slack(settings, text):
             return 1
         if not is_historical:

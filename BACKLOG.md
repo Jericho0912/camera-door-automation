@@ -28,35 +28,8 @@ there is no single-clip `.mp4` on disk. Getting one requires either:
 
 **Recorded:** 2026-09-01.
 
----
 
-## 2. Event snapshot images in Slack summary
-
-**Problem.** Frigate captures and saves a JPEG snapshot of detected persons
-(`has_snapshot` in the `event` table). Currently, the Slack summary is text-only
-and links to Notion pages. Having a visual snapshot preview of unknown visitors
-directly in Slack would allow immediate recognition without clicking into Notion.
-
-**Technical considerations & constraints:**
-
-- **Slack Incoming Webhook limitations:** Standard incoming webhooks
-  (`hooks.slack.com`) do not support direct multipart/binary file uploads.
-  They only support JSON Block Kit payloads referencing an image URL (`image_url`),
-  which must be publicly accessible (e.g. an S3 presigned URL).
-- **Bot Token alternative:** Directly uploading binary images to Slack requires the
-  Slack Web API (`files.uploadV2`) and a Slack Bot User OAuth Token (`xoxb-...`)
-  with `files:write` scope, replacing or complementing the simple webhook model.
-- **S3 Snapshot delivery:** If using `image_url` with webhooks, snapshot JPEGs
-  must be uploaded to S3 and presigned (similar to video segment clips).
-- **Privacy:** Storing visitor face photos on Slack servers permanently retains
-  biometric images externally. Opt-in gating (`SLACK_INCLUDE_SNAPSHOTS=false` by
-  default) must be preserved.
-
-**Recorded:** 2026-09-01.
-
----
-
-## 3. Mac mini and Frigate downtime / outage monitoring in Slack
+## 2. Mac mini and Frigate downtime / outage monitoring in Slack
 
 **Problem.** If the Mac mini loses power, sleeps unexpectedly, or Frigate NVR
 crashes / goes offline, camera logging stops silently during the outage. While
