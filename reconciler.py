@@ -1007,7 +1007,7 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
             since = float(last) if last is not None else now - 86_400.0
             until = now
             header_ts = now
-            by_field = "recorded_at" if last is not None else "start_time"
+            by_field = "recorded_at"
             is_historical = False
 
         rows = unknown_events_between(state, since, until, by_field=by_field)

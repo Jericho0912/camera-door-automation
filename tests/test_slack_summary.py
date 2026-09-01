@@ -360,11 +360,11 @@ def test_slack_summary_for_specific_date(settings_factory, http):
     
     # 2026-08-19 in local time
     start_19, end_19, _ = rec.parse_date_window("2026-08-19")
-    seed_event(state, "e_aug19", person="Alice", recorded_at=start_19 + 3600.0)
+    seed_event(state, "e_aug19", person="Alice", start=start_19 + 3600.0, end=start_19 + 3620.0, recorded_at=start_19 + 3600.0)
     
     # Another day (2026-08-20)
     start_20, _, _ = rec.parse_date_window("2026-08-20")
-    seed_event(state, "e_aug20", person="Bob", recorded_at=start_20 + 3600.0)
+    seed_event(state, "e_aug20", person="Bob", start=start_20 + 3600.0, end=start_20 + 3620.0, recorded_at=start_20 + 3600.0)
     state.close()
 
     http.add(responses.POST, WEBHOOK, body="ok", status=200)
