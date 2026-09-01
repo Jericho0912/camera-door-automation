@@ -480,12 +480,14 @@ def test_slack_people_summary_posts_known_people_for_specific_date(settings_fact
     assert rec.slack_people_summary_now(settings, target_date="2026-08-19") == 0
 
     text = posted_text(http)
-    assert "Door Camera People Summary" in text
-    assert "Recognized People (2 people, 3 events)" in text
-    assert "Alice" in text
-    assert "Bob" in text
+    assert "People in Hackerhouse" in text
+    assert "1. Alice" in text
+    assert "2. Bob" in text
     assert "Carol" not in text
     assert "Unknown Visitors" not in text
+    assert "Events" not in text
+    assert "First seen" not in text
+    assert "Last seen" not in text
 
 
 def test_slack_people_summary_invalid_date_format_fails(settings_factory, capsys):

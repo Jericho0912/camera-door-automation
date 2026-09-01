@@ -153,7 +153,7 @@ python3 reconciler.py slack-summary --date 2026-08-19
 
 The scheduled message is unknown-only unless `SLACK_INCLUDE_KNOWN=true`. To send
 a separate familiar-people summary for a local calendar day, without changing
-the scheduled cursor:
+the scheduled cursor, use the plain numbered-name list:
 
 ```bash
 python3 reconciler.py slack-people-summary 2026-08-19
