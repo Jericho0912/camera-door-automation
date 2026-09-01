@@ -51,3 +51,89 @@ into how long the system was down or whether coverage was interrupted.
   `⚠️ System Outage Notice: Mac mini was offline/sleeping for 2h 15m (13:30–15:45)`.
 
 **Recorded:** 2026-09-01.
+
+---
+
+## 3. Prometheus and Grafana observability
+
+**Problem.** Today the reconciler mostly communicates failures through logs,
+`status`, and Slack summaries. That is enough for a home Mac mini deployment,
+but it does not teach or expose production-style observability concepts.
+
+**Good-to-have learning goal.** Add a small metrics surface that can be scraped
+by Prometheus and visualized in Grafana, without making Prometheus/Grafana a
+hard requirement for the current Slack/S3/Notion workflow.
+
+**Potential metrics:**
+
+- Reconciliation pass duration and last successful pass timestamp.
+- Events seen, completed, failed, and retried.
+- Notion sync success/failure counts and gave-up counts.
+- Clip refresh success/failure counts.
+- Slack summary posts, failures, and last posted window.
+- Snapshot uploads attempted/succeeded/failed.
+- Frigate DB snapshot failures and downtime windows once outage tracking exists.
+
+**Why it is intentionally later.** Running a metrics endpoint, Prometheus, and
+Grafana is overkill for the current single-machine setup, but it is a useful
+bridge into monitoring, alerting, dashboards, service-level indicators, and
+capacity planning.
+
+**Recorded:** 2026-09-01.
+
+---
+
+## 4. Kubernetes deployment option
+
+**Problem.** The current service is intentionally Mac mini + launchd oriented
+because Fregata runs on that host and the recordings live on local disk. A future
+deployment may need to run in a Kubernetes cluster for better restart behavior,
+deployment hygiene, secret handling, and infrastructure learning.
+
+**Good-to-have learning goal.** Package the reconciler as a containerized service
+with Kubernetes manifests or a Helm chart, while keeping the current launchd path
+working.
+
+**Technical considerations:**
+
+- Container image for the Python reconciler and its dependencies.
+- Secret management for AWS, Notion, and Slack credentials.
+- Persistent storage for `reconciler-state.db` or migration to a server-side DB.
+- Access to Frigate/Fregata SQLite data and media files from inside the cluster.
+- CronJob vs Deployment for scheduled summaries and reconciliation loops.
+- Readiness/liveness probes and metrics integration if item 3 exists.
+
+**Why it is gated.** Fregata is currently local to the Mac mini, so Kubernetes
+does not help unless the event DB and media paths are made network-accessible or
+the camera/NVR stack also moves.
+
+**Recorded:** 2026-09-01.
+
+---
+
+## 5. Native Frigate migration path for non-Mac hardware
+
+**Problem.** The current deployment depends on Fregata on a Mac mini. If the NVR
+moves to a Windows or Linux PC with NVIDIA graphics, the project should be able
+to run against native Frigate and preserve camera configuration and face data.
+
+**Good-to-have learning goal.** Build a migration pipeline that inventories,
+exports, validates, and restores the pieces needed to move from Fregata-on-Mac to
+native Frigate on GPU-backed hardware.
+
+**Potential pipeline pieces:**
+
+- Export and version Frigate/Fregata config files.
+- Validate camera, detector, object, zone, retention, and recording settings.
+- Export face-recognition assets or document exactly which Fregata data is not
+  portable to native Frigate.
+- Map media paths from macOS layout to Linux/Windows mount layout.
+- Dry-run migration checks against a sample native Frigate database.
+- Back up and restore `reconciler-state.db` so Notion/S3 deliveries do not
+  duplicate after migration.
+
+**Why it matters.** It turns hardware migration into a rehearsable process rather
+than a one-off manual rebuild, and it creates a clean learning track for config
+management, data migration, backups, and platform portability.
+
+**Recorded:** 2026-09-01.

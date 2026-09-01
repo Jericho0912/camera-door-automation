@@ -899,6 +899,48 @@ def known_events_between(state: sqlite3.Connection, since: float, until: float, 
          ORDER BY e.person ASC""", (since, until)).fetchall()
 
 
+def refresh_people_from_source(state: sqlite3.Connection, settings: Settings, since: float, until: float) -> None:
+    """Backfill person labels for historical summaries from the source Fregata DB.
+
+    Rows created before the Slack summary feature have event_delivery.person=NULL
+    forever unless we re-read Fregata. A date-specific "unknown visitors" summary
+    must use the event's actual face-recognition result, not stale state shape.
+    """
+    tmp: Path | None = None
+    fconn: sqlite3.Connection | None = None
+    try:
+        tmp = snapshot_db(settings.source_db)
+        fconn = sqlite3.connect(tmp)
+        fconn.row_factory = sqlite3.Row
+        table, cols = resolve_table(fconn, ("event", "events"), EVENT_REQUIRED)
+        if "sub_label" not in cols:
+            return
+        where = ["start_time >= ?", "start_time <= ?", "label = ?"]
+        params: list[Any] = [since, until, settings.label]
+        if settings.camera:
+            where.append("camera = ?")
+            params.append(settings.camera)
+        updates = []
+        for row in fconn.execute(
+                f"SELECT id, sub_label FROM {qident(table)} WHERE {' AND '.join(where)}",
+                params):
+            person = recognized_person({"sub_label": parse_json(row["sub_label"])})
+            updates.append((person, time.time(), str(row["id"])))
+        if updates:
+            state.executemany(
+                "UPDATE event_delivery SET person=?, updated_at=? WHERE event_id=?",
+                updates)
+            state.commit()
+    except Exception as exc:
+        LOG.warning("Could not refresh Slack summary people from Fregata source DB: %s", exc)
+    finally:
+        if fconn is not None:
+            fconn.close()
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+
 def render_slack_summary(rows: list[sqlite3.Row], now: float, known_rows: list[sqlite3.Row] | None = None,
                          snapshot_urls: dict[str, str] | None = None) -> dict[str, Any]:
     day = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%a %d %b")
@@ -1072,6 +1114,9 @@ def slack_summary_now(settings: Settings, target_date: str | None = None) -> int
             header_ts = now
             by_field = "recorded_at"
             is_historical = False
+
+        if is_historical:
+            refresh_people_from_source(state, settings, since, until)
 
         rows = unknown_events_between(state, since, until, by_field=by_field)
         known = known_events_between(state, since, until, by_field=by_field) if settings.slack_include_known else []

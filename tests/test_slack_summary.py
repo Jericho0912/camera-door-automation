@@ -13,7 +13,7 @@ import pytest
 import responses
 
 import reconciler as rec
-from conftest import NOW
+from conftest import NOW, build_source_db, make_event
 
 WEBHOOK = "https://hooks.slack.com/services/T000/B000/XXXX"
 
@@ -418,6 +418,46 @@ def test_slack_summary_for_specific_date(settings_factory, http):
     finally:
         state.close()
 
+
+
+def test_specific_date_refreshes_person_from_source_before_unknown_filter(settings_factory, http):
+    """Old state rows with NULL person must not make known visitors look unknown."""
+    settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK, slack_include_known=False)
+    start_19, _, _ = rec.parse_date_window("2026-08-19")
+    build_source_db(settings.source_db, events=[
+        make_event(id="e_known", start_time=start_19 + 60.0, end_time=start_19 + 80.0,
+                   sub_label="Alice"),
+        make_event(id="e_unknown", start_time=start_19 + 120.0, end_time=start_19 + 150.0,
+                   sub_label=None),
+    ])
+    state = rec.open_state(settings.state_db)
+    try:
+        seed_event(state, "e_known", start=start_19 + 60.0, end=start_19 + 80.0, person=None)
+        seed_event(state, "e_unknown", start=start_19 + 120.0, end=start_19 + 150.0, person=None)
+        state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                         VALUES('e_known','alpha-page-id',?,?)""", (NOW, NOW))
+        state.execute("""INSERT INTO notion_delivery(event_id,page_id,synced_at,updated_at)
+                         VALUES('e_unknown','omega-page-id',?,?)""", (NOW, NOW))
+        state.commit()
+    finally:
+        state.close()
+
+    http.add(responses.POST, WEBHOOK, body="ok", status=200)
+    assert rec.slack_summary_now(settings, target_date="2026-08-19") == 0
+
+    text = posted_text(http)
+    assert "1 unknown visitor" in text
+    assert "omegapageid" in text
+    assert "alphapageid" not in text
+    assert "Alice" not in text
+
+    state = rec.open_state(settings.state_db)
+    try:
+        person = state.execute(
+            "SELECT person FROM event_delivery WHERE event_id='e_known'").fetchone()[0]
+        assert person == "Alice"
+    finally:
+        state.close()
 
 def test_slack_summary_invalid_date_format_fails(settings_factory, capsys):
     settings = settings_factory(dry_run=False, slack_webhook_url=WEBHOOK)
